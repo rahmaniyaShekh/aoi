@@ -1,0 +1,13 @@
+{
+  "name": "aoi-connect",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node test/rendezvous.test.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4.143.0"
+  }
+}

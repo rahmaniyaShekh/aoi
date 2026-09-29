@@ -1,0 +1,797 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<!-- The real policy is sent as a header by the Worker (frame-ancestors only
+     works there). This copy keeps the page locked down when opened from disk. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; connect-src 'self'; media-src 'self' blob:; img-src 'self' data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; manifest-src 'self'; base-uri 'none'; form-action 'none'">
+<title>Listen to a PC</title>
+<link rel="manifest" href="/aoi/manifest.webmanifest">
+<link rel="icon" href="/aoi/icon.svg" type="image/svg+xml">
+<style>
+  /* Same visual language as the screen-share page: flat, quiet, no
+     gradients, no shadows. Everything interactive is at least 44 px. */
+  :root{
+    color-scheme:light dark;
+    --bg:#ffffff; --fg:#14181d; --muted:#5b646e; --line:#d6dbe1;
+    --field:#f6f7f9; --accent:#0b57d0; --on:#ffffff; --err:#b3261e; --ok:#1a7f37;
+    --mono:ui-monospace,SFMono-Regular,"Cascadia Mono",Consolas,monospace;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{--bg:#0e1116; --fg:#e6edf3; --muted:#9aa4af; --line:#2a313c;
+          --field:#161b22; --accent:#7aa7ff; --on:#0e1116; --err:#ff7b72; --ok:#3fb950}
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;
+       padding:env(safe-area-inset-top) env(safe-area-inset-right)
+               env(safe-area-inset-bottom) env(safe-area-inset-left)}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  [hidden]{display:none !important}
+  button{font:inherit;color:inherit;cursor:pointer}
+  main{max-width:30rem;margin:0 auto;padding:2rem 1.25rem 3rem}
+  h1{font-size:1.25rem;margin:0 0 .25rem}
+  .sub{color:var(--muted);font-size:.875rem;margin:0 0 1.5rem}
+  .muted{color:var(--muted)}
+  .small{font-size:.8125rem}
+
+  /* ---- join ------------------------------------------------------------ */
+  .saved{list-style:none;margin:0 0 1.5rem;padding:0}
+  .saved li{display:flex;align-items:center;gap:.25rem;border-bottom:1px solid var(--line)}
+  .saved .pick{flex:1;display:flex;align-items:baseline;gap:.625rem;min-height:3rem;
+               background:none;border:0;padding:.75rem .25rem;text-align:left;min-width:0}
+  .saved .pick:hover .nm{text-decoration:underline}
+  .saved .nm{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .saved .cd{font-family:var(--mono);color:var(--muted);font-size:.875rem;letter-spacing:.08em;flex:none}
+  .saved .act{background:none;border:0;color:var(--muted);font-size:.8125rem;min-height:2.75rem;padding:0 .5rem}
+  .saved .act:hover{color:var(--fg)}
+  label{display:block;font-size:.875rem;margin:0 0 .375rem}
+  #code{width:100%;background:var(--field);color:var(--fg);border:1px solid var(--line);
+        border-radius:.5rem;padding:.75rem;font:1.5rem var(--mono);letter-spacing:.2em;
+        text-align:center;text-transform:uppercase}
+  #code::placeholder{letter-spacing:.1em;font-size:1rem;text-transform:none;color:var(--muted)}
+  #code:focus{outline:2px solid var(--accent);outline-offset:-1px}
+  .go{width:100%;margin-top:1rem;background:var(--accent);color:var(--on);border:0;
+      border-radius:.5rem;min-height:3rem;padding:.75rem;font-weight:600}
+  .go:disabled{opacity:.5;cursor:default}
+  .plain{width:100%;margin-top:.75rem;background:none;border:1px solid var(--line);border-radius:.5rem;min-height:3rem}
+  #status:empty,#error:empty{display:none}
+  #status{margin-top:1rem;color:var(--muted);font-size:.9375rem}
+  #error{margin-top:1rem;color:var(--err);font-size:.9375rem}
+  .hint{margin-top:2.5rem;color:var(--muted);font-size:.8125rem}
+  .cmd{display:flex;align-items:center;gap:.5rem;margin:.5rem 0;background:var(--field);border:1px solid var(--line);
+       border-radius:.5rem;padding:.25rem .25rem .25rem .75rem}
+  .cmd code{flex:1;font:.8125rem var(--mono);color:var(--fg);overflow-wrap:anywhere}
+  .cmd button{background:none;border:0;color:var(--accent);min-height:2.75rem;padding:0 .75rem;font-size:.8125rem}
+  .hint a{color:var(--accent)}
+
+  /* ---- listen ------------------------------------------------------------ */
+  #host{display:flex;align-items:baseline;gap:.5rem}
+  #host h1{margin:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  #talking{color:var(--ok);font-size:.8125rem;font-weight:600;flex:none}
+  #line{color:var(--muted);font-size:.875rem;margin:.125rem 0 1rem}
+  #viz{display:block;width:100%;height:4rem}
+
+  /* the three main controls: sound | mic | leave, mic in the middle */
+  .bar{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;justify-items:center;
+       margin:1.25rem 0 .5rem}
+  .ctl{display:flex;flex-direction:column;align-items:center;gap:.375rem;background:none;border:0;padding:0;
+       font-size:.8125rem;color:var(--muted);min-width:4.5rem}
+  .ctl .i{display:grid;place-items:center;width:3.25rem;height:3.25rem;border-radius:50%;
+          border:1px solid var(--line);background:var(--field);color:var(--fg)}
+  .ctl:hover .i{border-color:var(--muted)}
+  .ctl.mic .i{width:4.5rem;height:4.5rem;border:0;background:var(--accent);color:var(--on)}
+  .ctl.mic.live .i{background:var(--ok)}
+  .ctl.mic:disabled{opacity:.45;cursor:default}
+  .ctl.off .i{background:var(--fg);color:var(--bg);border-color:var(--fg)}
+  .ctl.leave .i{color:var(--err)}
+  .ctl svg{width:1.5rem;height:1.5rem}
+  .ctl.mic svg{width:1.875rem;height:1.875rem}
+  #micLvl{display:block;height:3px;width:4.5rem;border-radius:2px;background:var(--line);overflow:hidden}
+  #micLvl i{display:block;height:100%;width:0;background:var(--ok)}
+  .ctl.mic:not(.live) #micLvl{visibility:hidden}
+
+  section.group{border-top:1px solid var(--line);margin-top:1.25rem;padding-top:1rem}
+  .gt{font-size:.8125rem;color:var(--muted);margin:0 0 .5rem}
+  .row{display:grid;grid-template-columns:6.5rem 1fr 3.5rem;align-items:center;gap:.75rem;min-height:3rem}
+  .row .nm{font-size:.9375rem;line-height:1.2}
+  .row .nm small{display:block;color:var(--muted);font-size:.75rem}
+  .row .val{font:.8125rem var(--mono);color:var(--muted);text-align:right;background:none;border:0;
+            min-height:2.75rem;padding:0}
+  .row.dim .nm,.row.dim input{opacity:.45}
+  input[type=range]{width:100%;margin:0;height:2.75rem;accent-color:var(--accent);background:none}
+  .check{display:flex;align-items:center;justify-content:space-between;gap:1rem;min-height:3rem;
+         background:none;border:0;padding:0;width:100%;text-align:left}
+  .check small{display:block;color:var(--muted);font-size:.75rem}
+  .sw{flex:none;width:2.75rem;height:1.5rem;border-radius:.75rem;background:var(--line);position:relative}
+  .sw::after{content:"";position:absolute;top:.1875rem;left:.1875rem;width:1.125rem;height:1.125rem;border-radius:50%;
+             background:var(--bg)}
+  .check[aria-checked=true] .sw{background:var(--accent)}
+  .check[aria-checked=true] .sw::after{left:1.4375rem}
+  .seg{display:grid;grid-template-columns:repeat(3,1fr);border:1px solid var(--line);border-radius:.5rem;overflow:hidden}
+  .seg button{background:none;border:0;border-left:1px solid var(--line);min-height:2.75rem;padding:.375rem .25rem;
+              font-size:.875rem;line-height:1.2}
+  .seg button:first-child{border-left:0}
+  .seg button small{display:block;color:var(--muted);font-size:.6875rem}
+  .seg button[aria-pressed=true]{background:var(--accent);color:var(--on)}
+  .seg button[aria-pressed=true] small{color:inherit;opacity:.85}
+  details{margin-top:1.25rem;border-top:1px solid var(--line);padding-top:.75rem}
+  summary{cursor:pointer;color:var(--muted);font-size:.8125rem;min-height:2.75rem;display:flex;align-items:center}
+  #stats{font:.75rem/1.7 var(--mono);color:var(--muted);white-space:pre-wrap;margin:0}
+
+  dialog{border:1px solid var(--line);border-radius:.75rem;background:var(--bg);color:var(--fg);
+         padding:1.25rem;max-width:22rem;width:calc(100% - 2.5rem)}
+  dialog::backdrop{background:#0008}
+  dialog h2{font-size:1.0625rem;margin:0 0 .5rem}
+  dialog p{margin:0 0 1.25rem;color:var(--muted);font-size:.9375rem}
+  dialog .btns{display:flex;gap:.75rem}
+  dialog .btns button{flex:1;min-height:2.75rem;border-radius:.5rem;border:1px solid var(--line);background:none}
+  dialog .btns .yes{background:var(--accent);color:var(--on);border-color:var(--accent);font-weight:600}
+  #tap{margin:.5rem 0 0}
+</style>
+</head>
+<body>
+<main>
+  <!-- ============ join ============ -->
+  <section id="join">
+    <h1>Listen to a PC</h1>
+    <p class="sub">Enter the code shown on the host PC. Audio comes straight from it to you, encrypted.</p>
+    <ul class="saved" id="saved" hidden></ul>
+    <form id="joinForm" autocomplete="off">
+      <label for="code">Code</label>
+      <input id="code" inputmode="text" autocapitalize="characters" spellcheck="false" maxlength="7" placeholder="e.g. K7Q-4MX">
+      <button class="go" id="goBtn" type="submit" disabled>Listen</button>
+      <button class="plain" id="cancelBtn" type="button" hidden>Cancel</button>
+    </form>
+    <div id="status" role="status"></div>
+    <div id="error" role="alert"></div>
+    <div class="hint">
+      <p style="margin:0">To share a Windows 11 PC, install AOI from its GitHub release (repository access needed). In PowerShell:</p>
+      <div class="cmd"><code id="installCmd">gh release download -R rahmaniyaShekh/aoi -p install.ps1 -O - | Out-String | iex</code><button id="copyCmd" type="button">Copy</button></div>
+      <p style="margin:0">Then <code>aoi start</code> shows the code, <code>aoi stop</code> ends it. No admin, nothing to set up.</p>
+    </div>
+  </section>
+
+  <!-- ============ listen ============ -->
+  <section id="listen" hidden>
+    <div id="host"><h1 id="hostName">Host</h1><span id="talking" hidden>● talking</span></div>
+    <div id="line">Connected</div>
+    <canvas id="viz" aria-hidden="true"></canvas>
+    <p id="tap" hidden><button class="go" id="tapBtn" type="button">Tap to start sound</button></p>
+
+    <div class="bar">
+      <button class="ctl" id="soundBtn" type="button" aria-pressed="false">
+        <span class="i"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H3v6h3l5 4z"/><path id="soundWaves" d="M15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"/></svg></span>
+        <span id="soundLbl">Sound on</span>
+      </button>
+      <button class="ctl mic" id="micBtn" type="button" aria-pressed="false">
+        <span class="i"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></span>
+        <span id="micLbl">Talk</span>
+        <span id="micLvl"><i></i></span>
+      </button>
+      <button class="ctl leave" id="leaveBtn" type="button">
+        <span class="i"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 12H4M8 8l-4 4 4 4"/><path d="M13 4h5a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-5"/></svg></span>
+        <span>Leave</span>
+      </button>
+    </div>
+
+    <section class="group">
+      <p class="gt">Mix</p>
+      <div class="row" id="rowVol"><div class="nm">Volume</div><input type="range" id="vol" min="0" max="100" value="100" aria-label="Volume"><button class="val" id="volVal" type="button">100%</button></div>
+      <div class="row" id="rowMusic"><div class="nm">Music<small>their speaker</small></div><input type="range" id="music" min="-30" max="10" step="1" value="0" aria-label="Their speaker level"><button class="val" id="musicVal" type="button" title="Mute / unmute">0 dB</button></div>
+      <div class="row" id="rowVoice"><div class="nm">Voice<small id="voiceSub">their mic</small></div><input type="range" id="voice" min="-30" max="10" step="1" value="0" aria-label="Their microphone level"><button class="val" id="voiceVal" type="button" title="Mute / unmute">0 dB</button></div>
+      <button class="check" id="duck" type="button" role="switch" aria-checked="true"><span>Lower music while they talk<small>keeps their voice clear</small></span><span class="sw"></span></button>
+    </section>
+
+    <section class="group">
+      <p class="gt">Connection</p>
+      <div class="seg" id="mode" role="group" aria-label="Buffering">
+        <button type="button" data-m="live" aria-pressed="false">Low delay<small>~0.1 s</small></button>
+        <button type="button" data-m="balanced" aria-pressed="true">Balanced<small>adapts</small></button>
+        <button type="button" data-m="stable" aria-pressed="false">Unbreakable<small>~0.6 s+</small></button>
+      </div>
+      <button class="check" id="saver" type="button" role="switch" aria-checked="false"><span>Data saver<small>about 48 kbps</small></span><span class="sw"></span></button>
+    </section>
+
+    <details id="details"><summary>Connection details</summary><pre id="stats"></pre></details>
+  </section>
+</main>
+
+<dialog id="micAsk">
+  <h2>Turn on your microphone?</h2>
+  <p>The host will hear you until you turn it off again.</p>
+  <div class="btns"><button id="micNo" type="button">Cancel</button><button class="yes" id="micYes" type="button">Turn on</button></div>
+</dialog>
+
+<audio id="player" autoplay playsinline></audio>
+
+<script>
+'use strict';
+// ============================================================================
+// Protocol constants (must match the host and the rendezvous Worker)
+// ============================================================================
+const BASE = '/aoi';
+const ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
+const PREFIX = 'AOI1:', MAGIC = [0x41, 0x4f, 0x49, 0x31], FLAG_ENC = 1;
+const SALT_LEN = 16, IV_LEN = 12, TAG_LEN = 16, PBKDF2_ITER = 200000;
+const ATTEMPT_TIMEOUT = 25000, GATHER_TIMEOUT = 8000;
+const STORE = 'aoi.hosts', PREFS = 'aoi.prefs';   // aoi.* keys: never collide with the screen-share page on this origin
+
+const $ = id => document.getElementById(id);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+
+// ============================================================================
+// Codes and the sealed blob (byte-identical to the host's crypto.cpp)
+// ============================================================================
+const normalizeCode = s => (s || '').toUpperCase().split('').filter(c => ALPHABET.includes(c)).join('').slice(0, 6);
+const prettyCode = c => c.length > 3 ? c.slice(0, 3) + '-' + c.slice(3) : c;
+async function roomIdFor(code) {
+  const h = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(code));
+  return [...new Uint8Array(h)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+const b64urlEncode = b => { let s = ''; for (const x of b) s += String.fromCharCode(x); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); };
+const b64urlDecode = t => { const n = t.replace(/-/g, '+').replace(/_/g, '/'); const b = atob(n + '='.repeat((4 - n.length % 4) % 4)); return Uint8Array.from(b, c => c.charCodeAt(0)); };
+const pipe = (t, b) => new Response(new Blob([b]).stream().pipeThrough(t)).arrayBuffer().then(a => new Uint8Array(a));
+const deflateRaw = b => pipe(new CompressionStream('deflate-raw'), b);
+const inflateRaw = b => pipe(new DecompressionStream('deflate-raw'), b);
+const concat = (...p) => { const o = new Uint8Array(p.reduce((a, x) => a + x.length, 0)); let k = 0; for (const x of p) { o.set(x, k); k += x.length; } return o; };
+async function deriveKey(pass, salt) {
+  const m = await crypto.subtle.importKey('raw', new TextEncoder().encode(pass), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: PBKDF2_ITER, hash: 'SHA-256' }, m, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}
+async function sealBlob(text, code) {
+  const body = await deflateRaw(new TextEncoder().encode(text));
+  const salt = crypto.getRandomValues(new Uint8Array(SALT_LEN)), iv = crypto.getRandomValues(new Uint8Array(IV_LEN));
+  const head = concat(new Uint8Array(MAGIC), new Uint8Array([FLAG_ENC]), salt, iv);
+  const key = await deriveKey(code, salt);
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: head, tagLength: TAG_LEN * 8 }, key, body));
+  return PREFIX + b64urlEncode(concat(head, ct));
+}
+async function openBlob(blob, code) {
+  const raw = b64urlDecode(blob.trim().slice(PREFIX.length));
+  if (raw.length < 5 || MAGIC.some((m, i) => raw[i] !== m)) throw new Error('not a blob');
+  if (!(raw[4] & FLAG_ENC)) return new TextDecoder().decode(await inflateRaw(raw.subarray(5)));
+  const headLen = 5 + SALT_LEN + IV_LEN, head = raw.subarray(0, headLen);
+  const key = await deriveKey(code, raw.subarray(5, 5 + SALT_LEN));
+  let plain;
+  try { plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: raw.subarray(5 + SALT_LEN, headLen), additionalData: head, tagLength: TAG_LEN * 8 }, key, raw.subarray(headLen)); }
+  catch { throw new Error('wrong code'); }
+  return new TextDecoder().decode(await inflateRaw(new Uint8Array(plain)));
+}
+
+// ============================================================================
+// Local storage: remembered hosts and preferences (never sent anywhere)
+// ============================================================================
+const loadJSON = (k, d) => { try { const v = JSON.parse(localStorage.getItem(k) || 'null'); return v ?? d; } catch { return d; } };
+const saveJSON = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch { } };
+const loadSaved = () => { const v = loadJSON(STORE, []); return Array.isArray(v) ? v.filter(e => e && typeof e.code === 'string') : []; };
+const findSaved = code => loadSaved().find(e => e.code === code);
+function rememberHost(code, name) {       // only ever called once audio actually played
+  const prev = findSaved(code);
+  const list = loadSaved().filter(e => e.code !== code);
+  list.unshift({ code, name: (prev?.custom ? prev.name : (name || prev?.name || '')).trim(), custom: !!prev?.custom, at: Date.now() });
+  saveJSON(STORE, list.slice(0, 12));
+}
+const defaults = { music_db: 0, voice_db: 0, music_mute: false, voice_mute: false, duck: true, mode: 'balanced', saver: false, vol: 100 };
+let prefs = Object.assign({}, defaults, loadJSON(PREFS, {}));
+const savePrefs = () => saveJSON(PREFS, prefs);
+
+// ============================================================================
+// Screens
+// ============================================================================
+function status(text) { $('status').textContent = text || ''; }
+function joining(on) {
+  $('goBtn').hidden = on; $('cancelBtn').hidden = !on; $('code').disabled = on;
+}
+function showJoin(msg) {
+  stopAll();
+  $('listen').hidden = true; $('join').hidden = false;
+  joining(false); status(''); $('error').textContent = msg || '';
+  renderSaved();
+  if (location.pathname !== BASE + '/') history.replaceState(null, '', BASE + '/');
+  document.title = 'Listen to a PC';
+}
+function showListen() { $('join').hidden = true; $('listen').hidden = false; }
+function deviceName() {
+  const ua = navigator.userAgent;
+  if (/iPhone/.test(ua)) return 'iPhone';
+  if (/iPad/.test(ua)) return 'iPad';
+  if (/Android/.test(ua)) return /Mobile/.test(ua) ? 'Android phone' : 'Android tablet';
+  if (/Mac/.test(ua)) return 'Mac';
+  if (/Windows/.test(ua)) return 'Windows PC';
+  return 'Browser';
+}
+function renderSaved() {
+  const list = loadSaved(), ul = $('saved');
+  ul.hidden = !list.length;
+  ul.replaceChildren();
+  for (const e of list) {
+    const li = document.createElement('li');
+    const pick = document.createElement('button'); pick.type = 'button'; pick.className = 'pick';
+    const nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = e.name || 'Host';
+    const cd = document.createElement('span'); cd.className = 'cd'; cd.textContent = prettyCode(e.code);
+    pick.append(nm, cd); pick.onclick = () => start(e.code);
+    const ren = document.createElement('button'); ren.type = 'button'; ren.className = 'act'; ren.textContent = 'Rename';
+    ren.onclick = () => {
+      const n = prompt('Name this host', e.name || '');
+      if (n === null) return;
+      const l = loadSaved(), x = l.find(y => y.code === e.code);
+      if (x) { x.name = n.trim().slice(0, 40); x.custom = true; }
+      saveJSON(STORE, l); renderSaved();
+    };
+    const del = document.createElement('button'); del.type = 'button'; del.className = 'act'; del.textContent = 'Forget';
+    del.onclick = () => { saveJSON(STORE, loadSaved().filter(y => y.code !== e.code)); renderSaved(); };
+    li.append(pick, ren, del);
+    ul.append(li);
+  }
+}
+
+// ============================================================================
+// Rendezvous API
+// ============================================================================
+let iceCache = null;
+async function iceServers() {
+  if (iceCache && Date.now() - iceCache.at < 3600e3) return iceCache.servers;
+  try {
+    const r = await fetch(`${BASE}/api/turn`, { cache: 'no-store' });
+    if (r.ok) { const j = await r.json(); iceCache = { at: Date.now(), servers: j.iceServers }; return j.iceServers; }
+  } catch { }
+  return [{ urls: ['stun:stun.cloudflare.com:3478', 'stun:stun.l.google.com:19302'] }];
+}
+async function getOffer(id) {
+  const r = await fetch(`${BASE}/api/room/${id}`, { cache: 'no-store' });
+  if (r.status === 404) return null;
+  if (r.status === 429) throw new Error('slow');
+  if (!r.ok) throw new Error('server');
+  return r.json();
+}
+
+// ============================================================================
+// Session
+// ============================================================================
+let generation = 0;
+const S = { pc: null, dc: null, stream: null, receiver: null, sender: null, code: '', name: '', hello: null, hostStat: null,
+  talkTrack: null, jbTarget: 0, cleanSince: 0, last: null, view: null, ctx: null, analyser: null, wake: null, statTimer: 0, live: false };
+window.__aoi = S;   // for automated end-to-end tests
+
+function stopAll() {
+  generation++;
+  endTalk();
+  if (S.dc && S.dc.readyState === 'open') { try { S.dc.send(JSON.stringify({ t: 'bye' })); } catch { } }
+  try { S.pc?.close(); } catch { }
+  S.pc = S.dc = null; S.live = false;
+  clearInterval(S.statTimer);
+  $('player').srcObject = null;
+  try { S.wake?.release(); } catch { } S.wake = null;
+  if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'none';
+}
+
+function start(code) {
+  code = normalizeCode(code);
+  if (code.length !== 6) return;
+  stopAll();
+  const gen = ++generation;
+  S.code = code;
+  $('code').value = prettyCode(code);
+  $('error').textContent = '';
+  $('listen').hidden = true; $('join').hidden = false;
+  joining(true);
+  status('Finding the host…');
+  if (location.pathname !== `${BASE}/${prettyCode(code)}`) history.replaceState(null, '', `${BASE}/${prettyCode(code)}`);
+  try { S.ctx = S.ctx || new (window.AudioContext || window.webkitAudioContext)(); S.ctx.resume(); } catch { }  // inside the gesture
+  driver(code, Boolean(findSaved(code)), gen).catch(e => { if (gen === generation) showJoin(e.message || 'Something went wrong.'); });
+}
+
+// One loop owns the whole lifecycle; every await re-checks the generation so
+// a superseded attempt can never touch the connection that replaced it.
+async function driver(code, known, gen) {
+  const id = await roomIdFor(code);
+  let everConnected = false, waitingSince = Date.now();
+  while (gen === generation) {
+    let room;
+    try { room = await getOffer(id); }
+    catch (e) { status(e.message === 'slow' ? 'Busy, retrying…' : 'Waiting for the network…'); await sleep(2500); continue; }
+    if (gen !== generation) return;
+    if (!room || room.full) {
+      if (!room && !everConnected && !known && Date.now() - waitingSince > 15000)
+        return showJoin('Nobody is using that code right now. Check it and try again.');
+      if (S.live) { $('listen').hidden = true; $('join').hidden = false; joining(true); }
+      status(room?.full ? `${room.name || 'The host'} already has 2 listeners. Waiting for a free spot…`
+        : (known || everConnected) ? 'Waiting for the host to come back…' : 'Finding the host…');
+      await sleep(Date.now() - waitingSince > 60000 ? 5000 : 1500);  // gentle on the server while waiting long
+      continue;
+    }
+    const outcome = await attempt(id, code, room, gen, () => { everConnected = known = true; });
+    if (gen !== generation) return;
+    if (outcome === 'badcode') return showJoin('That code is not right.');
+    if (outcome === 'kicked') return showJoin('The host removed you.');
+    if (outcome === 'newcode') { saveJSON(STORE, loadSaved().filter(e => e.code !== code)); return showJoin('The host changed their code. Ask them for the new one.'); }
+    $('listen').hidden = true; $('join').hidden = false; joining(true);
+    status(everConnected ? 'Reconnecting…' : 'Finding the host…');
+    if (outcome !== 'stale') await sleep(600);
+    waitingSince = Date.now();
+  }
+}
+
+function gatherComplete(pc, ms) {
+  if (pc.iceGatheringState === 'complete') return Promise.resolve();
+  return new Promise(res => {
+    const t = setTimeout(done, ms);
+    function done() { clearTimeout(t); pc.removeEventListener('icegatheringstatechange', chk); res(); }
+    function chk() { if (pc.iceGatheringState === 'complete') done(); }
+    pc.addEventListener('icegatheringstatechange', chk);
+  });
+}
+function deferred() { let r, s = false; const p = new Promise(x => r = x); return { promise: p, resolve: v => { if (!s) { s = true; r(v); } } }; }
+
+// Browsers decode Opus in mono unless *their own* SDP says stereo=1.
+function mungeAnswer(sdp) {
+  const m = sdp.match(/a=rtpmap:(\d+) opus\/48000\/2/i);
+  if (!m) return sdp;
+  const pt = m[1], want = { stereo: '1', 'sprop-stereo': '1', maxaveragebitrate: '510000', useinbandfec: '1' };
+  const re = new RegExp(`a=fmtp:${pt} ([^\\r\\n]*)`);
+  if (re.test(sdp)) return sdp.replace(re, (all, p) => {
+    const kv = Object.fromEntries(p.split(';').filter(Boolean).map(x => x.trim().split('=')));
+    Object.assign(kv, want);
+    return `a=fmtp:${pt} ` + Object.entries(kv).map(([k, v]) => `${k}=${v}`).join(';');
+  });
+  return sdp.replace(m[0], `${m[0]}\r\na=fmtp:${pt} ` + Object.entries(want).map(([k, v]) => `${k}=${v}`).join(';'));
+}
+
+async function attempt(id, code, room, gen, onLive) {
+  let sdp;
+  try { sdp = await openBlob(room.offer, code); } catch (e) { return e.message === 'wrong code' ? 'badcode' : 'failed'; }
+  if (gen !== generation) return 'aborted';
+  status('Connecting…');
+  const pc = new RTCPeerConnection({ iceServers: await iceServers(), bundlePolicy: 'max-bundle' });
+  S.pc = pc; S.hello = null; S.hostStat = null; S.last = null; S.jbTarget = 0;
+  let done = deferred(), gotAudio = false, byeReason = '';
+
+  pc.ontrack = ev => {
+    S.stream = ev.streams[0] || new MediaStream([ev.track]);
+    S.receiver = ev.receiver;
+    const p = $('player');
+    p.srcObject = S.stream;
+    p.volume = prefs.vol / 100;
+    p.play().then(() => { $('tap').hidden = true; }).catch(() => { $('tap').hidden = false; });
+    applyBuffer();
+  };
+  pc.ondatachannel = ev => {
+    const dc = ev.channel;
+    S.dc = dc;
+    dc.onopen = () => { send({ t: 'name', name: deviceName() }); sendPrefs(); };
+    dc.onmessage = e => {
+      let m; try { m = JSON.parse(e.data); } catch { return; }
+      if (m.t === 'hello') { S.hello = m; S.name = m.name || ''; renderHost(); }
+      else if (m.t === 'stat') { S.hostStat = m; renderHost(); }
+      else if (m.t === 'bye') { byeReason = m.reason || ''; done.resolve('bye'); }
+    };
+    dc.onclose = () => done.resolve(S.live ? 'dropped' : 'failed');
+  };
+  let disc = 0;
+  pc.onconnectionstatechange = () => {
+    const s = pc.connectionState;
+    if (s === 'failed' || s === 'closed') done.resolve('failed');
+    if (s === 'disconnected') { clearTimeout(disc); disc = setTimeout(() => pc.connectionState === 'disconnected' && done.resolve('dropped'), 7000); }
+    if (s === 'connected') clearTimeout(disc);
+  };
+
+  try {
+    await pc.setRemoteDescription({ type: 'offer', sdp });
+    const tr = pc.getTransceivers()[0];
+    // Send-capable from the start with no track, so Talk later is a
+    // replaceTrack and needs no renegotiation (there is no signalling left).
+    if (tr) tr.direction = 'sendrecv';
+    S.sender = tr ? tr.sender : null;
+    const ans = await pc.createAnswer();
+    await pc.setLocalDescription({ type: 'answer', sdp: mungeAnswer(ans.sdp) });
+    await gatherComplete(pc, GATHER_TIMEOUT);
+    if (gen !== generation) { pc.close(); return 'aborted'; }
+    const answer = await sealBlob(pc.localDescription.sdp, code);
+    const post = await fetch(`${BASE}/api/room/${id}/answer`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ answer, session: room.session }) });
+    if (post.status === 409) { pc.close(); return 'stale'; }  // the other listener took this offer: take the next one
+    if (!post.ok) { pc.close(); return 'failed'; }
+
+    const timer = setTimeout(() => done.resolve('timeout'), ATTEMPT_TIMEOUT);
+    // "Connected" means audio packets arrived, not merely that ICE said so.
+    const watch = setInterval(async () => {
+      if (gen !== generation) return done.resolve('aborted');
+      try {
+        const st = await (S.receiver ? S.receiver.getStats() : pc.getStats());
+        st.forEach(r => { if (r.type === 'inbound-rtp' && r.kind === 'audio' && r.packetsReceived > 5) gotAudio = true; });
+        if (gotAudio) { status('Starting sound…'); if (S.dc && S.dc.readyState === 'open') done.resolve('connected'); }
+      } catch { }
+    }, 300);
+    let why = await done.promise;
+    clearTimeout(timer); clearInterval(watch);
+    if (why !== 'connected') { pc.close(); return why === 'bye' ? byeKind(byeReason) : why; }
+
+    onLive();
+    S.live = true;
+    rememberHost(code, S.name);
+    enterListening();
+    done = deferred();                    // the handlers above now report the drop
+    why = await done.promise;
+    S.live = false;
+    endTalk();
+    clearInterval(S.statTimer);
+    try { pc.close(); } catch { }
+    return why === 'bye' ? byeKind(byeReason) : 'dropped';
+  } catch { try { pc.close(); } catch { } return 'failed'; }
+}
+function byeKind(r) { return /removed/.test(r) ? 'kicked' : /code changed/.test(r) ? 'newcode' : 'dropped'; }
+function send(o) { try { if (S.dc && S.dc.readyState === 'open') S.dc.send(JSON.stringify(o)); } catch { } }
+function sendPrefs() {
+  send({ t: 'prefs', music_db: prefs.music_db, voice_db: prefs.voice_db, music_mute: prefs.music_mute, voice_mute: prefs.voice_mute,
+    duck: prefs.duck, max_kbps: prefs.saver ? 48 : 256 });
+}
+
+// ============================================================================
+// Listening: host info, adaptive buffer, stats, visualiser
+// ============================================================================
+async function enterListening() {
+  showListen();
+  joining(false); status('');
+  renderHost(); renderPrefs();
+  document.title = `${S.name || 'Host'} · Listening`;
+  if ('wakeLock' in navigator) { try { S.wake = await navigator.wakeLock.request('screen'); } catch { } }
+  if ('mediaSession' in navigator) {
+    try {
+      navigator.mediaSession.metadata = new MediaMetadata({ title: S.name || 'Host PC', artist: 'Live audio', album: 'AOI' });
+      navigator.mediaSession.playbackState = 'playing';
+    } catch { }
+  }
+  setupViz();
+  clearInterval(S.statTimer);
+  S.statTimer = setInterval(pollStats, 1000);
+}
+
+function renderHost() {
+  $('hostName').textContent = S.name || 'Host';
+  const st = S.hostStat || S.hello || {};
+  const mic = !!st.mic;
+  $('rowVoice').classList.toggle('dim', !mic);
+  $('voice').disabled = !mic;
+  $('voiceSub').textContent = mic ? 'their mic' : 'their mic is off';
+  $('talking').hidden = !S.hostStat?.speaking;
+  const canTalk = !!st.talk && !!navigator.mediaDevices?.getUserMedia;
+  $('micBtn').disabled = !canTalk;
+  if (!canTalk) { endTalk(); $('micLbl').textContent = 'Talk off'; }
+  else if (!S.talkTrack) $('micLbl').textContent = 'Talk';
+}
+
+function applyBuffer() {
+  const r = S.receiver;
+  if (!r) return;
+  const ms = Math.round(S.jbTarget);
+  if ('jitterBufferTarget' in r) { try { r.jitterBufferTarget = ms; } catch { } }
+  else if ('playoutDelayHint' in r) { try { r.playoutDelayHint = ms / 1000; } catch { } }
+}
+
+// Buffer policy. "Low delay" lets the browser run as tight as it can.
+// "Balanced" and "Unbreakable" start from a floor, grow the moment the
+// browser has to conceal audio (the one thing a listener actually hears),
+// shrink back slowly over clean stretches, and always keep room for a lost
+// packet to be resent and still arrive in time.
+function bufferPolicy(rtt, concealFrac) {
+  const floor = prefs.mode === 'live' ? 0 : prefs.mode === 'stable' ? 600 : 150;
+  const ceil = prefs.mode === 'stable' ? 3000 : prefs.mode === 'balanced' ? 1200 : 400;
+  let t = S.jbTarget || floor;
+  const now = Date.now();
+  if (concealFrac > 0.002) { t += prefs.mode === 'live' ? 40 : 90; S.cleanSince = now; }
+  else if (now - (S.cleanSince || now) > 20000) { t -= 15; S.cleanSince = now - 15000; }
+  const repair = prefs.mode === 'live' ? 0 : rtt * 1.5 + 40;
+  t = clamp(Math.max(t, floor, repair), floor, ceil);
+  if (Math.abs(t - S.jbTarget) >= 5) { S.jbTarget = t; applyBuffer(); }
+}
+
+async function pollStats() {
+  const pc = S.pc;
+  if (!pc) return;
+  let inb, pair, local, remote, codec;
+  try {
+    const st = await pc.getStats();
+    st.forEach(r => {
+      if (r.type === 'inbound-rtp' && r.kind === 'audio') inb = r;
+      if (r.type === 'transport' && r.selectedCandidatePairId) pair = st.get(r.selectedCandidatePairId);
+    });
+    if (!pair) st.forEach(r => { if (r.type === 'candidate-pair' && (r.nominated || r.selected) && r.state === 'succeeded') pair = r; });
+    if (pair) { local = st.get(pair.localCandidateId); remote = st.get(pair.remoteCandidateId); }
+    if (inb?.codecId) codec = st.get(inb.codecId);
+  } catch { return; }
+  if (!inb) return;
+  const now = performance.now(), p = S.last;
+  S.last = { t: now, recv: inb.packetsReceived || 0, lost: inb.packetsLost || 0, conceal: (inb.concealedSamples || 0) - (inb.silentConcealedSamples || 0),
+    total: inb.totalSamplesReceived || 0, jbd: inb.jitterBufferDelay || 0, jbe: inb.jitterBufferEmittedCount || 0, bytes: inb.bytesReceived || 0,
+    fec: inb.fecPacketsReceived || 0, nack: inb.nackCount || 0 };
+  if (!p) return;
+  const c = S.last;
+  const dRecv = c.recv - p.recv, dLost = Math.max(0, c.lost - p.lost);
+  const loss = dRecv + dLost > 0 ? dLost / (dRecv + dLost) : 0;
+  const concealFrac = c.total > p.total ? Math.max(0, c.conceal - p.conceal) / (c.total - p.total) : 0;
+  const buf = c.jbe > p.jbe ? (c.jbd - p.jbd) / (c.jbe - p.jbe) * 1000 : 0;
+  const kbps = (c.bytes - p.bytes) * 8 / ((c.t - p.t) / 1000) / 1000;
+  const rtt = pair?.currentRoundTripTime ? pair.currentRoundTripTime * 1000 : (S.hostStat?.rtt || 0);
+  const relay = local?.candidateType === 'relay' || remote?.candidateType === 'relay';
+  bufferPolicy(rtt, concealFrac);
+  send({ t: 'rx', buf, conceal: concealFrac, loss, rtt, path: relay ? 'relay' : 'direct', jitter: (inb.jitter || 0) * 1000 });
+  S.view = { kbps, rtt, loss, concealFrac, buf, relay, fec: c.fec, nack: c.nack, jitter: (inb.jitter || 0) * 1000, target: S.jbTarget,
+    codec: codec ? `${codec.mimeType.split('/')[1]} ${codec.channels || ''}ch` : 'opus' };
+  renderStats();
+}
+
+function quality(v) {
+  const bad = v.concealFrac * 100 + v.loss * 10 + v.rtt / 300;
+  return bad < 0.3 ? 'Excellent' : bad < 1 ? 'Good' : bad < 3 ? 'Fair' : 'Poor';
+}
+function renderStats() {
+  const v = S.view, h = S.hostStat || {};
+  if (!v) return;
+  const kb = Math.round(h.opus || v.kbps);
+  $('line').textContent = `${quality(v)} connection · ${kb} kbps ${h.stereo === false ? 'mono' : 'stereo'} · ${v.relay ? 'relayed' : 'direct'}`;
+  const lines = [
+    `codec       ${v.codec}${h.frame ? `, ${h.frame} ms frames` : ''}${h.fec ? ', FEC' : ''}`,
+    `bitrate     ${Math.round(v.kbps)} kbps received · host allows ${h.target || '–'} kbps`,
+    `round trip  ${Math.round(v.rtt)} ms · jitter ${v.jitter.toFixed(1)} ms`,
+    `buffer      ${Math.round(v.buf)} ms (target ${v.target ? Math.round(v.target) + ' ms' : 'browser'})`,
+    `loss        ${(v.loss * 100).toFixed(1)} % on the network, ${(v.concealFrac * 100).toFixed(2)} % heard`,
+    `protection  ${h.red ? 'redundancy ×' + h.red : 'redundancy off'} · resent ${h.retx || 0} · FEC used ${v.fec}`,
+    `congestion  ${h.cc || '–'}${h.queue ? ` · queue ${h.queue} ms` : ''}`,
+  ];
+  $('stats').textContent = lines.join('\n');
+}
+
+function setupViz() {
+  const canvas = $('viz'), g = canvas.getContext('2d');
+  try {
+    if (!S.ctx) S.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    S.ctx.resume();
+    const src = S.ctx.createMediaStreamSource(S.stream);
+    S.analyser = S.ctx.createAnalyser();
+    S.analyser.fftSize = 2048;
+    S.analyser.smoothingTimeConstant = 0.8;
+    src.connect(S.analyser);  // analysis only: sound plays through the <audio> element
+  } catch { S.analyser = null; }
+  const bins = new Uint8Array(1024), bars = 40, myGen = generation;
+  function frame() {
+    if (myGen !== generation || $('listen').hidden) return;
+    const dpr = devicePixelRatio || 1, w = canvas.clientWidth, h = canvas.clientHeight;
+    if (canvas.width !== Math.round(w * dpr)) { canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr); }
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, w, h);
+    if (S.analyser) S.analyser.getByteFrequencyData(bins);
+    g.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--accent');
+    const bw = w / bars;
+    for (let i = 0; i < bars; i++) {
+      const f0 = 50 * Math.pow(320, i / bars), f1 = 50 * Math.pow(320, (i + 1) / bars);  // log bands 50 Hz .. 16 kHz
+      const k0 = Math.floor(f0 / 24000 * 1024), k1 = Math.max(k0 + 1, Math.floor(f1 / 24000 * 1024));
+      let v = 0; for (let k = k0; k < k1 && k < 1024; k++) v = Math.max(v, bins[k]);
+      const bh = Math.max(2, v / 255 * h);
+      g.fillRect(i * bw + 1, h - bh, Math.max(1, bw - 2), bh);
+    }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+}
+
+// ============================================================================
+// Talk back (asks first before the microphone goes on; off is immediate)
+// ============================================================================
+async function beginTalk() {
+  if (!S.sender || S.talkTrack) return;
+  try {
+    const ms = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 } });
+    if (!S.live) { ms.getTracks().forEach(t => t.stop()); return; }
+    S.talkTrack = ms.getAudioTracks()[0];
+    await S.sender.replaceTrack(S.talkTrack);
+    try {
+      const p = S.sender.getParameters();
+      p.encodings = p.encodings && p.encodings.length ? p.encodings : [{}];
+      p.encodings[0].maxBitrate = 32000;     // wideband voice, light on the uplink
+      p.encodings[0].networkPriority = 'high';
+      await S.sender.setParameters(p);
+    } catch { }
+    $('micBtn').classList.add('live'); $('micBtn').setAttribute('aria-pressed', 'true');
+    $('micLbl').textContent = 'Mic on';
+    meterTalk(ms);
+  } catch (e) {
+    $('micLbl').textContent = 'No mic access';
+  }
+}
+function endTalk() {
+  if (!S.talkTrack) return;
+  try { S.sender?.replaceTrack(null); } catch { }
+  S.talkTrack.stop();
+  S.talkTrack = null;
+  $('micBtn').classList.remove('live'); $('micBtn').setAttribute('aria-pressed', 'false');
+  $('micLbl').textContent = 'Talk';
+  $('micLvl').firstChild.style.width = '0';
+}
+function meterTalk(ms) {
+  if (!S.ctx) return;
+  const a = S.ctx.createAnalyser(); a.fftSize = 512;
+  S.ctx.createMediaStreamSource(ms).connect(a);
+  const buf = new Float32Array(512);
+  (function tick() {
+    if (!S.talkTrack) return;
+    a.getFloatTimeDomainData(buf);
+    let s = 0; for (const x of buf) s += x * x;
+    $('micLvl').firstChild.style.width = clamp((10 * Math.log10(s / buf.length + 1e-9) + 60) / 60 * 100, 0, 100) + '%';
+    requestAnimationFrame(tick);
+  })();
+}
+$('micBtn').onclick = () => {
+  if (S.talkTrack) { endTalk(); return; }            // off: no question asked
+  const d = $('micAsk');
+  if (d.showModal) d.showModal(); else if (confirm('Turn on your microphone? The host will hear you.')) beginTalk();
+};
+$('micYes').onclick = () => { $('micAsk').close(); beginTalk(); };
+$('micNo').onclick = () => $('micAsk').close();
+
+// ============================================================================
+// Controls
+// ============================================================================
+const fmtDb = v => (v > 0 ? '+' : '') + v + ' dB';
+function renderPrefs() {
+  $('vol').value = prefs.vol; $('volVal').textContent = prefs.vol + '%';
+  $('music').value = prefs.music_db; $('musicVal').textContent = prefs.music_mute ? 'muted' : fmtDb(prefs.music_db);
+  $('voice').value = prefs.voice_db; $('voiceVal').textContent = prefs.voice_mute ? 'muted' : fmtDb(prefs.voice_db);
+  $('rowMusic').classList.toggle('dim', prefs.music_mute);
+  if (!$('voice').disabled) $('rowVoice').classList.toggle('dim', prefs.voice_mute);
+  $('duck').setAttribute('aria-checked', String(prefs.duck));
+  $('saver').setAttribute('aria-checked', String(prefs.saver));
+  for (const b of $('mode').children) b.setAttribute('aria-pressed', String(b.dataset.m === prefs.mode));
+  const muted = $('player').muted;
+  $('soundBtn').classList.toggle('off', muted); $('soundBtn').setAttribute('aria-pressed', String(muted));
+  $('soundLbl').textContent = muted ? 'Sound off' : 'Sound on';
+  $('soundWaves').style.display = muted ? 'none' : '';
+  if (/iPhone|iPad/.test(navigator.userAgent)) $('rowVol').hidden = true;  // iOS: the side buttons are the volume
+}
+let prefTimer = 0;
+function prefChanged() { renderPrefs(); savePrefs(); clearTimeout(prefTimer); prefTimer = setTimeout(sendPrefs, 60); }
+$('vol').oninput = e => { prefs.vol = +e.target.value; $('player').volume = prefs.vol / 100; prefChanged(); };
+$('volVal').onclick = () => { prefs.vol = 100; $('player').volume = 1; prefChanged(); };
+$('music').oninput = e => { prefs.music_db = +e.target.value; prefs.music_mute = false; prefChanged(); };
+$('voice').oninput = e => { prefs.voice_db = +e.target.value; prefs.voice_mute = false; prefChanged(); };
+$('musicVal').onclick = () => { prefs.music_mute = !prefs.music_mute; prefChanged(); };
+$('voiceVal').onclick = () => { prefs.voice_mute = !prefs.voice_mute; prefChanged(); };
+$('duck').onclick = () => { prefs.duck = !prefs.duck; prefChanged(); };
+$('saver').onclick = () => { prefs.saver = !prefs.saver; prefChanged(); };
+$('mode').onclick = e => { const b = e.target.closest('button'); if (!b) return; prefs.mode = b.dataset.m; S.jbTarget = 0; prefChanged(); bufferPolicy(S.view?.rtt || 0, 0); };
+$('soundBtn').onclick = () => { const p = $('player'); p.muted = !p.muted; renderPrefs(); };
+$('leaveBtn').onclick = () => showJoin();
+$('cancelBtn').onclick = () => showJoin();
+$('tapBtn').onclick = () => { S.ctx?.resume(); $('player').play().then(() => $('tap').hidden = true).catch(() => { }); };
+$('copyCmd').onclick = async () => {
+  try { await navigator.clipboard.writeText($('installCmd').textContent); $('copyCmd').textContent = 'Copied'; setTimeout(() => $('copyCmd').textContent = 'Copy', 1500); } catch { }
+};
+const input = $('code');
+input.addEventListener('input', () => {
+  const c = normalizeCode(input.value);
+  input.value = prettyCode(c);
+  $('goBtn').disabled = c.length !== 6;
+  $('error').textContent = '';
+});
+$('joinForm').onsubmit = e => { e.preventDefault(); start(input.value); };
+document.addEventListener('visibilitychange', async () => {
+  if (document.visibilityState === 'visible' && S.live && 'wakeLock' in navigator) { try { S.wake = await navigator.wakeLock.request('screen'); } catch { } }
+});
+window.addEventListener('pagehide', () => send({ t: 'bye' }));
+
+// ============================================================================
+// Boot
+// ============================================================================
+(function boot() {
+  const ok = window.RTCPeerConnection && window.crypto?.subtle && window.DecompressionStream && window.CompressionStream;
+  if (!ok) { $('error').textContent = 'This browser is too old. Please use a current Chrome, Edge, Safari or Firefox.'; $('goBtn').disabled = true; return; }
+  renderSaved(); renderPrefs();
+  const m = location.pathname.slice(BASE.length).match(/^\/([A-Za-z0-9-]{6,7})\/?$/);
+  const deep = m ? normalizeCode(m[1]) : '';
+  if (deep.length === 6) { input.value = prettyCode(deep); $('goBtn').disabled = false; start(deep); }  // a link is a request to listen
+  else input.focus();
+})();
+</script>
+</body>
+</html>

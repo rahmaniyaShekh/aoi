@@ -1,0 +1,9 @@
+host/build/
+dist/
+.tools/
+rendezvous/node_modules/
+rendezvous/.wrangler/
+host/res/app.ico
+*.log
+rendezvous/*.cpuprofile
+third_party/

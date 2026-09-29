@@ -1,0 +1,39 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "aoi-connect",
+  "main": "src/index.js",
+  "compatibility_date": "2026-09-20",
+
+  // run_worker_first: every request goes through the Worker so the security
+  // headers are always applied and /aoi/<code> deep links resolve to the page.
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "not_found_handling": "none",
+    "html_handling": "auto-trailing-slash",
+    "run_worker_first": true
+  },
+
+  "durable_objects": {
+    "bindings": [{ "name": "ROOMS", "class_name": "AoiRoom" }]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["AoiRoom"] }
+  ],
+
+  // Room lookups by IP: generous for a waiting listener (~40/min), useless
+  // for scanning 887 million codes.
+  "ratelimits": [
+    { "name": "LOOKUP_LIMIT", "namespace_id": "4201", "simple": { "limit": 90, "period": 60 } }
+  ],
+
+  // share.mdarif.online is already a Custom Domain of the screen-share Worker.
+  // A route runs in front of a Custom Domain, so only /aoi* comes here and the
+  // rest of the hostname is untouched.
+  "routes": [
+    { "pattern": "share.mdarif.online/aoi*", "zone_name": "mdarif.online" }
+  ],
+
+  "workers_dev": true,
+  "observability": { "enabled": true }
+}

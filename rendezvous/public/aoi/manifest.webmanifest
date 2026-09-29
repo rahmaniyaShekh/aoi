@@ -1,0 +1,11 @@
+{
+  "name": "AOI - Audio Over Internet",
+  "short_name": "AOI",
+  "description": "Listen to a PC's audio from anywhere.",
+  "start_url": "/aoi/",
+  "scope": "/aoi/",
+  "display": "standalone",
+  "background_color": "#0e1116",
+  "theme_color": "#0e1116",
+  "icons": [{ "src": "/aoi/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}
