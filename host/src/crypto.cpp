@@ -129,6 +129,40 @@ std::optional<std::string> inflate_raw(const uint8_t *p, size_t n, size_t limit)
   return out;
 }
 
+std::vector<uint8_t> aead_seal(const std::vector<uint8_t> &key, const uint8_t *p, size_t n) {
+  std::vector<uint8_t> out(12 + n + 16);
+  random_bytes(out.data(), 12);
+  EVP_CIPHER_CTX *c = EVP_CIPHER_CTX_new();
+  int len = 0;
+  EVP_EncryptInit_ex(c, EVP_aes_256_gcm(), nullptr, nullptr, nullptr);
+  EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_GCM_SET_IVLEN, 12, nullptr);
+  EVP_EncryptInit_ex(c, nullptr, nullptr, key.data(), out.data());
+  EVP_EncryptUpdate(c, out.data() + 12, &len, p, int(n));
+  int total = len;
+  EVP_EncryptFinal_ex(c, out.data() + 12 + total, &len);
+  EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_GCM_GET_TAG, 16, out.data() + 12 + n);
+  EVP_CIPHER_CTX_free(c);
+  return out;
+}
+
+std::optional<std::vector<uint8_t>> aead_open(const std::vector<uint8_t> &key, const uint8_t *p, size_t n) {
+  if (key.size() != 32 || n < 28) return std::nullopt;
+  size_t ct = n - 28;
+  std::vector<uint8_t> out(ct + 16);
+  EVP_CIPHER_CTX *c = EVP_CIPHER_CTX_new();
+  int len = 0;
+  EVP_DecryptInit_ex(c, EVP_aes_256_gcm(), nullptr, nullptr, nullptr);
+  EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_GCM_SET_IVLEN, 12, nullptr);
+  EVP_DecryptInit_ex(c, nullptr, nullptr, key.data(), p);
+  EVP_DecryptUpdate(c, out.data(), &len, p + 12, int(ct));
+  EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_GCM_SET_TAG, 16, (void *)(p + 12 + ct));
+  int ok = EVP_DecryptFinal_ex(c, out.data() + len, &len);
+  EVP_CIPHER_CTX_free(c);
+  if (ok != 1) return std::nullopt;
+  out.resize(ct);
+  return out;
+}
+
 static bool derive_key(std::string_view code, const uint8_t *salt, uint8_t key[32]) {
   return PKCS5_PBKDF2_HMAC(code.data(), int(code.size()), salt, kSalt, kIter, EVP_sha256(), 32, key) == 1;
 }

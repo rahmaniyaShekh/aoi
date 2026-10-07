@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <!-- The real policy is sent as a header by the Worker (frame-ancestors only
      works there). This copy keeps the page locked down when opened from disk. -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; connect-src 'self'; media-src 'self' blob:; img-src 'self' data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; manifest-src 'self'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; connect-src 'self'; media-src 'self' blob:; img-src 'self' data:; style-src 'unsafe-inline'; script-src 'self' 'unsafe-inline'; manifest-src 'self'; base-uri 'none'; form-action 'none'">
 <title>Listen to a PC</title>
 <link rel="manifest" href="/aoi/manifest.webmanifest">
 <link rel="icon" href="/aoi/icon.svg" type="image/svg+xml">
@@ -355,7 +355,8 @@ async function getOffer(id) {
 // ============================================================================
 let generation = 0;
 const S = { pc: null, dc: null, stream: null, receiver: null, sender: null, code: '', name: '', hello: null, hostStat: null,
-  talkTrack: null, jbTarget: 0, cleanSince: 0, last: null, view: null, ctx: null, analyser: null, wake: null, statTimer: 0, live: false };
+  talkTrack: null, jbTarget: 0, cleanSince: 0, last: null, view: null, ctx: null, analyser: null, wake: null, statTimer: 0, live: false,
+  relay: null };
 window.__aoi = S;   // for automated end-to-end tests
 
 function stopAll() {
@@ -363,6 +364,7 @@ function stopAll() {
   endTalk();
   if (S.dc && S.dc.readyState === 'open') { try { S.dc.send(JSON.stringify({ t: 'bye' })); } catch { } }
   try { S.pc?.close(); } catch { }
+  relayClose();
   S.pc = S.dc = null; S.live = false;
   clearInterval(S.statTimer);
   $('player').srcObject = null;
@@ -391,6 +393,8 @@ function start(code) {
 async function driver(code, known, gen) {
   const id = await roomIdFor(code);
   let everConnected = false, waitingSince = Date.now(), failedInARow = 0;
+  // Once this tab has needed the relay for this host, go straight to it.
+  let useRelay = sessionStorage.getItem('aoi.relay.' + code) === '1', relayFails = 0;
   while (gen === generation) {
     let room;
     try { room = await getOffer(id); }
@@ -405,7 +409,11 @@ async function driver(code, known, gen) {
       await sleep(Date.now() - waitingSince > 60000 ? 5000 : 1500);  // gentle on the server while waiting long
       continue;
     }
-    const outcome = await attempt(id, code, room, gen, () => { everConnected = known = true; });
+    const canRelay = (room.caps || []).includes('relay') && relaySupported();
+    const viaRelay = useRelay && canRelay;
+    const outcome = viaRelay
+      ? await relayAttempt(id, code, room, gen, () => { everConnected = known = true; })
+      : await attempt(id, code, room, gen, () => { everConnected = known = true; });
     if (gen !== generation) return;
     if (outcome === 'badcode') return showJoin('That code is not right.');
     if (outcome === 'kicked') return showJoin('The host removed you.');
@@ -413,12 +421,20 @@ async function driver(code, known, gen) {
     $('listen').hidden = true; $('join').hidden = false; joining(true);
     // The host answered but no audio path formed: say so instead of an
     // endless "Connecting…", and keep trying (networks change, relays appear).
-    failedInARow = (outcome === 'timeout' || outcome === 'failed') ? failedInARow + 1 : 0;
-    netHint = failedInARow >= 2
-      ? `(Your network can't reach ${S.name || room.name || 'the host'} directly` +
-        (iceCache?.turn ? ', even through the relay.)' : '; a relay is needed between these two networks.)')
+    const failed = outcome === 'timeout' || outcome === 'failed';
+    failedInARow = failed ? failedInARow + 1 : 0;
+    if (failed && !viaRelay && canRelay) {
+      // No direct path between these two networks: carry the audio through
+      // the server instead (end-to-end encrypted, works on any network).
+      useRelay = true;
+    } else if (failed && viaRelay && ++relayFails >= 2) {
+      useRelay = false; relayFails = 0;   // relay keeps failing: try direct again
+    }
+    const who = S.name || room.name || 'the host';
+    netHint = failedInARow >= 2 && !canRelay
+      ? `(Your network can't reach ${who} directly. Ask them to run "aoi update" so audio can be relayed.)`
       : '';
-    status(everConnected ? 'Reconnecting…' : 'Finding the host…');
+    status(useRelay ? 'Connecting through the relay…' : everConnected ? 'Reconnecting…' : 'Finding the host…');
     if (outcome !== 'stale') await sleep(600);
     waitingSince = Date.now();
   }
@@ -504,9 +520,19 @@ async function attempt(id, code, room, gen, onLive) {
     if (!post.ok) { pc.close(); return 'failed'; }
 
     const timer = setTimeout(() => done.resolve('timeout'), ATTEMPT_TIMEOUT);
+    const posted = Date.now();
     // "Connected" means audio packets arrived, not merely that ICE said so.
     const watch = setInterval(async () => {
       if (gen !== generation) return done.resolve('aborted');
+      // Seven seconds of connectivity checks without a single reply means the
+      // two networks cannot reach each other: stop waiting, use the relay.
+      if (Date.now() - posted > 7000 && (room.caps || []).includes('relay')) {
+        try {
+          let sent = 0, answered = 0;
+          (await pc.getStats()).forEach(r => { if (r.type === 'candidate-pair') { sent += r.requestsSent || 0; answered += r.responsesReceived || 0; } });
+          if (sent > 10 && answered === 0 && pc.iceConnectionState !== 'connected') return done.resolve('failed');
+        } catch { }
+      }
       try {
         const st = await (S.receiver ? S.receiver.getStats() : pc.getStats());
         st.forEach(r => { if (r.type === 'inbound-rtp' && r.kind === 'audio' && r.packetsReceived > 5) gotAudio = true; });
@@ -532,7 +558,184 @@ async function attempt(id, code, room, gen, onLive) {
   } catch { try { pc.close(); } catch { } return 'failed'; }
 }
 function byeKind(r) { return /removed/.test(r) ? 'kicked' : /code changed/.test(r) ? 'newcode' : 'dropped'; }
-function send(o) { try { if (S.dc && S.dc.readyState === 'open') S.dc.send(JSON.stringify(o)); } catch { } }
+function send(o) {
+  if (S.relay) { relaySend(2, new TextEncoder().encode(JSON.stringify(o))); return; }
+  try { if (S.dc && S.dc.readyState === 'open') S.dc.send(JSON.stringify(o)); } catch { }
+}
+
+// ============================================================================
+// Relay: audio through the server when no direct path exists
+// ============================================================================
+// The listener puts a fresh AES key inside its code-sealed answer; the host
+// opens it and both sides join a WebSocket pair on the server, which forwards
+// ciphertext it cannot read. The host sends Opus frames in ~80 ms batches;
+// they are decoded here with the browser's own Opus decoder and played
+// through a small jitter buffer (relay-worklet.js) into the same <audio>
+// element the direct path uses, so every control works the same.
+const relaySupported = () => 'AudioDecoder' in window && 'AudioWorkletNode' in window && 'WebSocket' in window;
+let relayChain = Promise.resolve();
+
+function relaySend(type, payload) {
+  const R = S.relay;
+  if (!R || R.ws.readyState !== 1) return;
+  const plain = new Uint8Array(payload.length + 1);
+  plain[0] = type; plain.set(payload, 1);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  crypto.subtle.encrypt({ name: 'AES-GCM', iv }, R.key, plain).then(ct => {
+    if (R.ws.readyState === 1) R.ws.send(concat(iv, new Uint8Array(ct)));
+  });
+}
+
+function relayClose() {
+  const R = S.relay;
+  if (!R) return;
+  S.relay = null;
+  try { R.ws.close(); } catch { }
+  try { R.decoder.state !== 'closed' && R.decoder.close(); } catch { }
+  try { R.player.disconnect(); } catch { }
+  clearInterval(R.ready);
+}
+
+async function relayAttempt(id, code, room, gen, onLive) {
+  status('Connecting through the relay…');
+  const raw = crypto.getRandomValues(new Uint8Array(32));
+  let answer;
+  try { answer = await sealBlob(JSON.stringify({ relay: 1, key: b64urlEncode(raw) }), code); } catch { return 'failed'; }
+  const post = await fetch(`${BASE}/api/room/${id}/answer`, { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ answer, session: room.session }) });
+  if (post.status === 409) return 'stale';
+  if (!post.ok) return 'failed';
+  if (gen !== generation) return 'aborted';
+
+  const key = await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['encrypt', 'decrypt']);
+  let ctx = S.ctx;
+  try { if (!ctx || ctx.state === 'closed') ctx = S.ctx = new (window.AudioContext || window.webkitAudioContext)(); await ctx.resume(); } catch { }
+  try { await ctx.audioWorklet.addModule(`${BASE}/relay-worklet.js`); } catch { return 'failed'; }
+  const player = new AudioWorkletNode(ctx, 'aoi-player', { numberOfInputs: 0, outputChannelCount: [2],
+    processorOptions: { inRate: 48000, targetMs: relayFloor() } });
+  const dest = ctx.createMediaStreamDestination();
+  player.connect(dest);
+  S.analyser = ctx.createAnalyser(); S.analyser.fftSize = 2048; S.analyser.smoothingTimeConstant = 0.8;
+  player.connect(S.analyser);
+
+  const done = deferred();
+  let gotPcm = false, byeReason = '';
+  const R = { ws: null, key, player, decoder: null, bytes: 0, report: null, prevReport: null, rtt: 0, target: relayFloor(),
+    cleanSince: Date.now(), ready: 0 };
+  R.decoder = new AudioDecoder({
+    output: ad => {
+      try {
+        const n = ad.numberOfFrames, ch = ad.numberOfChannels;
+        const l = new Float32Array(n), r = new Float32Array(n);
+        ad.copyTo(l, { planeIndex: 0, format: 'f32-planar' });
+        if (ch > 1) ad.copyTo(r, { planeIndex: 1, format: 'f32-planar' }); else r.set(l);
+        player.port.postMessage({ type: 'pcm', l, r }, [l.buffer, r.buffer]);
+        gotPcm = true;
+      } finally { ad.close(); }
+    },
+    error: () => done.resolve(S.live ? 'dropped' : 'failed'),
+  });
+  R.decoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 });
+  player.port.onmessage = e => { R.prevReport = R.report; R.report = e.data; };
+
+  const ws = new WebSocket(`${location.origin.replace(/^http/, 'ws')}${BASE}/api/room/${id}/relay?session=${room.session}&role=listener`);
+  ws.binaryType = 'arraybuffer';
+  R.ws = ws;
+  S.relay = R; S.pc = null; S.dc = null; S.hello = null; S.hostStat = null; S.last = null; S.sender = null;
+  const handle = async data => {
+    const buf = new Uint8Array(data);
+    if (buf.length < 29) return;
+    let plain;
+    try { plain = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: buf.subarray(0, 12) }, key, buf.subarray(12))); }
+    catch { return; }
+    if (S.relay !== R) return;
+    R.bytes += buf.length;
+    if (plain[0] === 1) {
+      let off = 2;
+      for (let i = 0; i < plain[1] && off + 6 <= plain.length; i++) {
+        const ts = ((plain[off] << 24) | (plain[off + 1] << 16) | (plain[off + 2] << 8) | plain[off + 3]) >>> 0;
+        const len = (plain[off + 4] << 8) | plain[off + 5];
+        off += 6;
+        if (off + len > plain.length) break;
+        try { R.decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: Math.round(ts * 1e6 / 48000), data: plain.subarray(off, off + len) })); } catch { }
+        off += len;
+      }
+    } else if (plain[0] === 2) {
+      let m; try { m = JSON.parse(new TextDecoder().decode(plain.subarray(1))); } catch { return; }
+      if (m.t === 'hello') { S.hello = m; S.name = m.name || ''; renderHost(); }
+      else if (m.t === 'stat') { S.hostStat = m; renderHost(); }
+      else if (m.t === 'pong') { R.rtt = Date.now() - m.id; }
+      else if (m.t === 'bye') { byeReason = m.reason || ''; done.resolve('bye'); }
+    }
+  };
+  // Decryption is async; chain it so frames are decoded in arrival order.
+  ws.onmessage = ev => { if (typeof ev.data !== 'string') relayChain = relayChain.then(() => handle(ev.data)); };
+  ws.onclose = () => done.resolve(S.live ? 'dropped' : 'failed');
+  ws.onopen = () => {
+    // Say hello until the host answers: it may join the relay after us.
+    const hi = () => { send({ t: 'name', name: deviceName() }); sendPrefs(); };
+    hi();
+    R.ready = setInterval(() => { if (S.hello) clearInterval(R.ready); else hi(); }, 1000);
+  };
+
+  const timer = setTimeout(() => done.resolve('timeout'), ATTEMPT_TIMEOUT);
+  const watch = setInterval(() => {
+    if (gen !== generation) return done.resolve('aborted');
+    if (gotPcm && S.hello) done.resolve('connected');
+    else if (S.hello) status('Starting sound…');
+  }, 300);
+  let why = await done.promise;
+  clearTimeout(timer); clearInterval(watch);
+  if (why !== 'connected') { relayClose(); return why === 'bye' ? byeKind(byeReason) : why; }
+
+  sessionStorage.setItem('aoi.relay.' + code, '1');
+  S.stream = dest.stream;
+  const p = $('player');
+  p.srcObject = dest.stream;
+  p.volume = prefs.vol / 100;
+  p.play().then(() => { $('tap').hidden = true; }).catch(() => { $('tap').hidden = false; });
+  onLive();
+  netHint = '';
+  S.live = true;
+  rememberHost(code, S.name);
+  enterListening();
+  const d2 = deferred();
+  done.resolve = d2.resolve;  // keep the same handlers, now reporting the drop
+  why = await d2.promise;
+  S.live = false;
+  endTalk();
+  clearInterval(S.statTimer);
+  relayClose();
+  return why === 'bye' ? byeKind(byeReason) : 'dropped';
+}
+
+const relayFloor = () => prefs.mode === 'live' ? 150 : prefs.mode === 'stable' ? 800 : 300;
+
+// Relay stats and buffer policy, once a second.
+function relayStats() {
+  const R = S.relay, rep = R.report, prev = R.prevReport;
+  if (!rep) return;
+  const now = performance.now();
+  const kbps = R.lastT ? (R.bytes - R.lastBytes) * 8 / ((now - R.lastT) / 1000) / 1000 : 0;
+  R.lastT = now; R.lastBytes = R.bytes;
+  let conceal = 0;
+  if (prev) {
+    const du = rep.under - prev.under, dp = rep.played - prev.played;
+    conceal = du + dp > 0 ? du / (du + dp) : 0;
+  }
+  // Same idea as the direct path: grow the buffer the moment audio runs dry,
+  // shrink it back slowly while clean.
+  const floor = relayFloor(), t0 = R.target;
+  if (conceal > 0.002) { R.target = Math.min(3000, R.target + 150); R.cleanSince = Date.now(); }
+  else if (Date.now() - R.cleanSince > 20000) { R.target = Math.max(floor, R.target - 20); R.cleanSince = Date.now() - 15000; }
+  R.target = Math.max(R.target, floor);
+  if (R.target !== t0) R.player.port.postMessage({ type: 'target', ms: R.target });
+  send({ t: 'rx', buf: rep.fillMs, conceal, loss: 0, rtt: R.rtt, path: 'relay' });
+  send({ t: 'ping', id: Date.now() });
+  S.view = { kbps, rtt: R.rtt, loss: 0, concealFrac: conceal, buf: rep.fillMs, relay: true, fec: 0, nack: 0, jitter: 0,
+    target: R.target, codec: 'opus (relayed)' };
+  renderStats();
+}
 function sendPrefs() {
   send({ t: 'prefs', music_db: prefs.music_db, voice_db: prefs.voice_db, music_mute: prefs.music_mute, voice_mute: prefs.voice_mute,
     duck: prefs.duck, max_kbps: prefs.saver ? 48 : 256 });
@@ -598,6 +801,7 @@ function bufferPolicy(rtt, concealFrac) {
 }
 
 async function pollStats() {
+  if (S.relay) return relayStats();
   const pc = S.pc;
   if (!pc) return;
   let inb, pair, local, remote, codec;
@@ -655,7 +859,7 @@ function renderStats() {
 
 function setupViz() {
   const canvas = $('viz'), g = canvas.getContext('2d');
-  try {
+  if (!S.relay) try {
     if (!S.ctx) S.ctx = new (window.AudioContext || window.webkitAudioContext)();
     S.ctx.resume();
     const src = S.ctx.createMediaStreamSource(S.stream);
@@ -690,6 +894,7 @@ function setupViz() {
 // Talk back (asks first before the microphone goes on; off is immediate)
 // ============================================================================
 async function beginTalk() {
+  if (S.relay) return beginRelayTalk();
   if (!S.sender || S.talkTrack) return;
   try {
     const ms = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 } });
@@ -710,8 +915,61 @@ async function beginTalk() {
     $('micLbl').textContent = 'No mic access';
   }
 }
+// Over the relay the mic is encoded here with the browser's Opus encoder and
+// sent as 20 ms frames, four to a message.
+async function beginRelayTalk() {
+  if (S.talkTrack || !('AudioEncoder' in window)) { if (!('AudioEncoder' in window)) $('micLbl').textContent = 'No mic on relay'; return; }
+  const ctx = S.ctx, rate = ctx.sampleRate;
+  try {
+    const cfg = { codec: 'opus', sampleRate: rate, numberOfChannels: 1, bitrate: 32000 };
+    if (!(await AudioEncoder.isConfigSupported(cfg)).supported) { $('micLbl').textContent = 'No mic on relay'; return; }
+    const ms = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 } });
+    if (!S.live || !S.relay) { ms.getTracks().forEach(t => t.stop()); return; }
+    S.talkTrack = ms.getAudioTracks()[0];
+    const batch = [];
+    const enc = new AudioEncoder({
+      output: chunk => {
+        const data = new Uint8Array(chunk.byteLength); chunk.copyTo(data);
+        const ts = Math.round(chunk.timestamp * 48000 / 1e6) >>> 0;
+        const f = new Uint8Array(6 + data.length);
+        f[0] = ts >>> 24; f[1] = (ts >>> 16) & 255; f[2] = (ts >>> 8) & 255; f[3] = ts & 255;
+        f[4] = data.length >> 8; f[5] = data.length & 255; f.set(data, 6);
+        batch.push(f);
+        if (batch.length >= 4) { relaySend(3, concat(new Uint8Array([batch.length]), ...batch)); batch.length = 0; }
+      },
+      error: () => endTalk(),
+    });
+    enc.configure(cfg);
+    const src = ctx.createMediaStreamSource(ms);
+    const cap = new AudioWorkletNode(ctx, 'aoi-capture');
+    const sink = ctx.createGain(); sink.gain.value = 0;
+    src.connect(cap); cap.connect(sink); sink.connect(ctx.destination);
+    const frame = Math.round(rate / 50);
+    let acc = new Float32Array(0), t = 0;
+    cap.port.onmessage = e => {
+      const a = new Float32Array(acc.length + e.data.length); a.set(acc); a.set(e.data, acc.length); acc = a;
+      while (acc.length >= frame && enc.state === 'configured') {
+        const pcm = acc.slice(0, frame); acc = acc.slice(frame);
+        enc.encode(new AudioData({ format: 'f32', sampleRate: rate, numberOfFrames: frame, numberOfChannels: 1, timestamp: t, data: pcm }));
+        t += frame * 1e6 / rate;
+      }
+    };
+    S.relayTalk = { enc, src, cap, sink };
+    $('micBtn').classList.add('live'); $('micBtn').setAttribute('aria-pressed', 'true');
+    $('micLbl').textContent = 'Mic on';
+    meterTalk(ms);
+  } catch (e) {
+    $('micLbl').textContent = 'No mic access';
+  }
+}
+
 function endTalk() {
   if (!S.talkTrack) return;
+  if (S.relayTalk) {
+    const T = S.relayTalk; S.relayTalk = null;
+    try { T.src.disconnect(); T.cap.disconnect(); T.sink.disconnect(); } catch { }
+    try { T.enc.state !== 'closed' && T.enc.close(); } catch { }
+  }
   try { S.sender?.replaceTrack(null); } catch { }
   S.talkTrack.stop();
   S.talkTrack = null;
@@ -769,7 +1027,12 @@ $('musicVal').onclick = () => { prefs.music_mute = !prefs.music_mute; prefChange
 $('voiceVal').onclick = () => { prefs.voice_mute = !prefs.voice_mute; prefChanged(); };
 $('duck').onclick = () => { prefs.duck = !prefs.duck; prefChanged(); };
 $('saver').onclick = () => { prefs.saver = !prefs.saver; prefChanged(); };
-$('mode').onclick = e => { const b = e.target.closest('button'); if (!b) return; prefs.mode = b.dataset.m; S.jbTarget = 0; prefChanged(); bufferPolicy(S.view?.rtt || 0, 0); };
+$('mode').onclick = e => {
+  const b = e.target.closest('button'); if (!b) return;
+  prefs.mode = b.dataset.m; S.jbTarget = 0; prefChanged();
+  if (S.relay) { S.relay.target = relayFloor(); S.relay.player.port.postMessage({ type: 'target', ms: S.relay.target }); }
+  else bufferPolicy(S.view?.rtt || 0, 0);
+};
 $('soundBtn').onclick = () => { const p = $('player'); p.muted = !p.muted; renderPrefs(); };
 $('leaveBtn').onclick = () => showJoin();
 $('cancelBtn').onclick = () => showJoin();

@@ -305,7 +305,24 @@ void Engine::host_loop() {
       l->shutdown();
       continue;
     }
-    if (!l->set_answer(*answer_sdp, &why)) {
+    if (!answer_sdp->empty() && (*answer_sdp)[0] == '{') {
+      // The listener's network cannot reach ours directly, so it asked for
+      // the relay; its sealed answer carries the relay key instead of an SDP.
+      json j = json::parse(*answer_sdp, nullptr, false);
+      auto key = j.is_object() && j.value("relay", 0) == 1 ? b64url_decode(j.value("key", "")) : std::nullopt;
+      if (!key || key->size() != 32) {
+        LOGW("answer rejected: malformed relay request");
+        l->shutdown();
+        continue;
+      }
+      std::string url = settings_.service + "/api/room/" + sha256_hex(code_) + "/relay?session=" + session +
+                        "&role=host&owner=" + owner_;
+      if (!l->start_relay(url, *key, &why)) {
+        LOGW("relay not started: %s", why.c_str());
+        l->shutdown();
+        continue;
+      }
+    } else if (!l->set_answer(*answer_sdp, &why)) {
       LOGW("answer not applied: %s", why.c_str());
       l->shutdown();
       continue;

@@ -99,20 +99,34 @@ of it for that path only. Separate Durable Objects, separate codes, separate
 browser storage keys (`aoi.*` vs `soi.*`), separate instance locks. Both hosts
 can run on the same PC at once.
 
-## Worth doing once: TURN
+## When two networks cannot reach each other: the relay
 
-Most listeners connect directly. When *both* sides sit behind strict NAT (some
-mobile carriers, some offices), a relay is needed. The Worker already hands out
-Cloudflare TURN credentials when two secrets exist:
+Most listeners connect directly, peer to peer. When *both* sides sit behind
+NATs that will not talk to each other (for example a carrier-grade NAT on one
+side and a strict router on the other), the page notices within about seven
+seconds (connectivity checks with no reply at all) and switches to the
+**relay**, automatically:
 
-1. Cloudflare dashboard → **Realtime → TURN Server** → create a TURN key.
-2. In `rendezvous/`:
-   ```bash
-   npx wrangler secret put TURN_KEY_ID
-   npx wrangler secret put TURN_KEY_TOKEN
-   ```
+- The page puts a fresh AES-256 key inside its code-sealed answer. The host
+  opens it, and both connect a WebSocket to the AOI Worker, which pairs them by
+  the handshake session and forwards the messages. Every message is AES-GCM
+  encrypted end to end; the server relays ciphertext it cannot read.
+- The host sends Opus in ~80 ms batches (40 ms frames, no redundancy: the
+  path is TCP, nothing is lost) and adapts the bitrate (16–192 kbps) to the
+  page's underruns and to how long its sends take. The page decodes with the
+  browser's built-in Opus decoder and plays through a small adaptive jitter
+  buffer (`relay-worklet.js`). Talkback works the same way in reverse.
+- It runs on the **free Workers plan**: about 12 messages a second per relayed
+  listener, billed at 1/20 of a request, so roughly 20 hours of relayed
+  listening a day. Direct connections never touch it.
+- Needs host **1.0.2** or later (`aoi update`); older hosts keep working
+  direct-only, and the page tells the listener to ask for the update.
 
-Nothing else changes; `aoi status` then shows "relay available".
+`aoi status` shows a relayed listener with `relay` as its path.
+
+Optional: if a Cloudflare Realtime TURN key is ever added (`wrangler secret put
+TURN_KEY_ID` / `TURN_KEY_TOKEN` in `rendezvous/`), browsers also get UDP relay
+candidates and many of these pairs connect through TURN instead.
 
 ## Layout
 
@@ -129,7 +143,7 @@ host/                 the Windows host (C++20, one static exe, no runtime depend
   src/netsim.*        bottleneck/loss/jitter simulator for testing
   src/cli.* control.* commands, detached daemon, named-pipe control
 rendezvous/           Cloudflare Worker + Durable Object + listener page
-  public/aoi/         the listener page (the installer is a GitHub release, not served here)
+  public/aoi/         the listener page + relay-worklet.js (the installer is a GitHub release, not served here)
   test/               contract tests (run against local or production)
 install.ps1           installer: fetches aoi.exe from the latest release with gh
 third_party/          dependency sources, fetched by host/deps.ps1 (not committed)

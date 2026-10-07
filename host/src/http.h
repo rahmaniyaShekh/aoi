@@ -21,8 +21,9 @@ class WebSocket {
  public:
   ~WebSocket();
   bool send(const std::string &text);
-  // Blocks until a text message arrives or the socket closes (nullopt).
-  std::optional<std::string> receive();
+  bool send_binary(const void *p, size_t n);
+  // Blocks until a message arrives or the socket closes (nullopt).
+  std::optional<std::string> receive(bool *binary = nullptr);
   void close();
   bool open() const { return ws_ != nullptr && !closed_; }
 

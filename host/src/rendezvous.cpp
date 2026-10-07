@@ -137,7 +137,7 @@ bool Rendezvous::publish(const std::string &session, const std::string &blob, st
   if (ws_up_) {
     int rid;
     { std::lock_guard lk(mu_); rid = next_rid_++; }
-    json m = {{"t", "pub"}, {"session", session}, {"offer", blob}, {"name", name_}, {"rid", rid}};
+    json m = {{"t", "pub"}, {"session", session}, {"offer", blob}, {"name", name_}, {"caps", {"relay"}}, {"rid", rid}};
     if (send_json(m.dump())) {
       std::unique_lock lk(mu_);
       if (cv_.wait_for(lk, std::chrono::seconds(8), [&] { return replies_.count(rid) || !ws_up_ || stop_; }) &&
@@ -151,7 +151,7 @@ bool Rendezvous::publish(const std::string &session, const std::string &blob, st
       }
     }
   }
-  json b = {{"id", room_}, {"session", session}, {"offer", blob}, {"owner", owner_}, {"name", name_}};
+  json b = {{"id", room_}, {"session", session}, {"offer", blob}, {"owner", owner_}, {"name", name_}, {"caps", {"relay"}}};
   return http_publish(b.dump(), err);
 }
 

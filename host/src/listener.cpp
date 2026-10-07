@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstring>
 
+#include "crypto.h"
 #include "util.h"
 
 using json = nlohmann::json;
@@ -84,7 +85,9 @@ void Listener::shutdown() {
   qcv_.notify_all();
   if (thread_.joinable() && thread_.get_id() != std::this_thread::get_id()) thread_.join();
   sim_.reset();
-  if (pc_) {
+  if (rws_) rws_->close();
+  if (relay_thread_.joinable() && relay_thread_.get_id() != std::this_thread::get_id()) relay_thread_.join();
+  if (pc_ && !relay_) {
     if (dc_) dc_->resetCallbacks();
     if (track_) track_->resetCallbacks();
     pc_->resetCallbacks();
@@ -205,22 +208,146 @@ bool Listener::set_answer(const std::string &sdp, std::string *err) {
     if (err) *err = e.what();
     return false;
   }
+  answered_us_ = now_us();
   state_ = State::Connecting;
   LOGI("listener %d: answer applied (red=%d twcc=%d nack=%d)", id_, caps_.red, caps_.twcc, caps_.nack);
   return true;
 }
 
+bool Listener::start_relay(const std::string &url, const std::vector<uint8_t> &key, std::string *err) {
+  // The WebRTC offer this listener was created for will not be used.
+  if (pc_) {
+    if (dc_) dc_->resetCallbacks();
+    if (track_) track_->resetCallbacks();
+    pc_->resetCallbacks();
+    try { pc_->close(); } catch (...) {}
+  }
+  relay_key_ = key;
+  relay_http_ = std::make_unique<Http>();
+  std::string e;
+  rws_ = relay_http_->websocket(url, 12000, &e);
+  if (!rws_) {
+    if (err) *err = e;
+    return false;
+  }
+  answered_us_ = now_us();
+  last_ctl_us_ = now_us();
+  relay_ = true;
+  state_ = State::Connecting;
+  relay_thread_ = std::thread([this] { relay_loop(); });
+  notify_settings();  // repeated by the sender loop until the page answers
+  LOGI("listener %d: relaying through the server (their network cannot reach this one directly)", id_);
+  return true;
+}
+
+void Listener::relay_send(uint8_t type, const uint8_t *p, size_t n) {
+  if (!rws_) return;
+  std::vector<uint8_t> plain(n + 1);
+  plain[0] = type;
+  if (n) memcpy(plain.data() + 1, p, n);
+  auto sealed = aead_seal(relay_key_, plain.data(), plain.size());
+  int64_t t0 = now_us();
+  if (!rws_->send_binary(sealed.data(), sealed.size())) {
+    if (state_ != State::Closed) LOGI("listener %d: relay closed", id_);
+    state_ = State::Closed;
+    return;
+  }
+  relay_send_ms_.add(double(now_us() - t0) / 1000.0, 0.2);
+}
+
+// ~80 ms of audio per message: few enough messages to sit comfortably inside
+// the free Workers quota, short enough to add little delay.
+void Listener::relay_frame(uint32_t ts, const uint8_t *p, size_t n, int frame_ms) {
+  if (relay_batch_.empty()) relay_batch_.assign(1, 0);  // frame count, filled in on send
+  uint8_t h[6];
+  put_be32(h, ts);
+  put_be16(h + 4, uint16_t(n));
+  relay_batch_.insert(relay_batch_.end(), h, h + 6);
+  relay_batch_.insert(relay_batch_.end(), p, p + n);
+  ++relay_batch_frames_;
+  relay_batch_ms_ += frame_ms;
+  if (relay_batch_ms_ >= 80 || relay_batch_frames_ >= 8) {
+    relay_batch_[0] = uint8_t(relay_batch_frames_);
+    relay_send(1, relay_batch_.data(), relay_batch_.size());
+    relay_batch_.clear();
+    relay_batch_frames_ = relay_batch_ms_ = 0;
+  }
+}
+
+// Over the relay the path is TCP: nothing is lost, so no redundancy; the only
+// question is how many bits fit. 40 ms frames halve the per-frame overhead.
+Plan Listener::relay_plan() {
+  Plan p;
+  int cap = std::min(prefs_.max_kbps, env_.host_max_kbps ? env_.host_max_kbps->load() : 256);
+  int k = std::clamp(relay_kbps_.load(), 16, std::max(16, std::min(cap, 192)));
+  p.target_bps = p.opus_bps = k * 1000;
+  p.frame_ms = 40;
+  p.stereo = k >= 48;
+  p.red = 0;
+  p.fec = false;
+  p.loss_pct = 0;
+  char why[96];
+  snprintf(why, sizeof why, "relayed via the server, %d kbps", k);
+  p.why = why;
+  return p;
+}
+
+void Listener::relay_loop() {
+  while (true) {
+    bool bin = false;
+    auto msg = rws_->receive(&bin);
+    if (!msg) break;
+    if (!bin) continue;  // runtime keepalive text
+    auto plain = aead_open(relay_key_, reinterpret_cast<const uint8_t *>(msg->data()), msg->size());
+    if (!plain || plain->empty()) continue;  // not from the listener who holds the key
+    int64_t now = now_us();
+    last_ctl_us_ = now;
+    if (!relay_heard_.exchange(true)) {
+      live_since_ = now;
+      state_ = State::Live;
+      LOGI("listener %d: live (relay)", id_);
+      notify_settings();
+    }
+    const uint8_t *p = plain->data();
+    size_t n = plain->size();
+    if (p[0] == 2) {
+      on_control(std::string(reinterpret_cast<const char *>(p + 1), n - 1));
+    } else if (p[0] == 3 && n >= 2 && env_.talk_allowed && *env_.talk_allowed) {
+      // talkback: [count][ts u32][len u16][opus]...
+      size_t off = 2;
+      for (int i = 0; i < p[1] && off + 6 <= n; ++i) {
+        uint32_t ts = be32(p + off);
+        size_t len = be16(p + off + 4);
+        off += 6;
+        if (off + len > n) break;
+        RtpPacketInfo rtp;
+        rtp.pt = kPtOpus;
+        rtp.seq = relay_talk_seq_++;
+        rtp.ts = ts;
+        rtp.ssrc = 1;
+        rtp.payload = p + off;
+        rtp.payload_len = len;
+        talk_.push(rtp, now);
+        off += len;
+      }
+    }
+  }
+  if (!shut_) state_ = State::Closed;
+}
+
 void Listener::close(const std::string &reason) {
   if (closing_.exchange(true)) return;
   close_reason_ = reason;
-  if (dc_open_) send_ctl(json{{"t", "bye"}, {"reason", reason}}.dump());
+  if (dc_open_ || relay_) send_ctl(json{{"t", "bye"}, {"reason", reason}}.dump());
   state_ = State::Closed;
 }
 
 bool Listener::dead() const {
   if (state_ == State::Closed) return true;
   int64_t now = now_us();
-  if (state_ == State::Connecting && now - created_us_ > 30000000) return true;  // never connected: free the slot
+  // Never connected: free the slot. Timed from the answer, not the offer -- an
+  // offer can sit waiting for minutes before someone takes it.
+  if (state_ == State::Connecting && answered_us_ && now - answered_us_ > 30000000) return true;
   if (disconnected_since_ && now - disconnected_since_ > 10000000) return true;   // ICE lost for 10 s
   if (state_ == State::Live && now - last_ctl_us_ > 12000000) return true;        // page gone quiet
   return false;
@@ -249,6 +376,29 @@ void Listener::sender_loop() {
     if (b) process_block(*b);
 
     int64_t now = now_us();
+    if (relay_) {
+      if (now - last_stat_us_ > 1000000) {
+        last_stat_us_ = now;
+        if (state_ != State::Live) { notify_settings(); continue; }  // until the page answers
+        send_stats();
+        // Relay rate control: back off when the page runs dry or sends start
+        // to block (the TCP path is full); creep up after 10 clean seconds.
+        if (now - relay_adapt_us_ > 2000000) {
+          relay_adapt_us_ = now;
+          double conceal;
+          { std::lock_guard lk(mu_); conceal = rx_conceal_; }
+          int k = relay_kbps_;
+          if (conceal > 0.005 || (relay_send_ms_.init && relay_send_ms_.v > 40)) {
+            relay_kbps_ = std::max(16, k * 3 / 4);
+            relay_clean_since_ = now;
+          } else if (now - relay_clean_since_ > 10000000) {
+            relay_kbps_ = std::min(192, k + 16);
+            relay_clean_since_ = now;
+          }
+        }
+      }
+      continue;
+    }
     if (state_ != State::Live) continue;
     // RTCP sender report once a second: gives the receiver's reports an RTT.
     if (now - last_sr_us_ > 1000000) {
@@ -333,7 +483,7 @@ void Listener::encode_frame() {
     std::lock_guard lk(mu_);
     caps_.max_bps = std::min(prefs_.max_kbps, env_.host_max_kbps ? env_.host_max_kbps->load() : 256) * 1000;
     caps = caps_;
-    plan = cc_.update(caps, now_us());
+    plan = relay_ ? relay_plan() : cc_.update(caps, now_us());
   }
   // Frame duration only changes on a frame boundary: exactly here.
   int frame_ms = applied_.frame_ms ? applied_.frame_ms : 20;
@@ -349,6 +499,18 @@ void Listener::encode_frame() {
   uint32_t ts = rtp_ts_;
   rtp_ts_ += uint32_t(n);
   if (len <= 0) return;
+  if (relay_) {
+    {
+      std::lock_guard lk(mu_);
+      ++packets_;
+      octets_ += uint32_t(len);
+      int64_t now = now_us();
+      wire_log_.push_back({now, int(len) + 8});
+      while (!wire_log_.empty() && now - wire_log_.front().first > 2000000) wire_log_.pop_front();
+    }
+    relay_frame(ts, out, size_t(len), frame_ms);
+    return;
+  }
 
   Frame primary{ts, std::vector<uint8_t>(out, out + len)};
   std::vector<uint8_t> pkt;
@@ -484,7 +646,7 @@ void Listener::on_control(const std::string &text) {
     std::lock_guard lk(mu_);
     name_ = nm;
   } else if (t == "ping") {
-    send_ctl(json{{"t", "pong"}, {"id", m.value("id", 0)}}.dump());
+    send_ctl(json{{"t", "pong"}, {"id", m.contains("id") ? m["id"] : json(0)}}.dump());  // echo as sent: a ms timestamp overflows int
   } else if (t == "bye") {
     LOGI("listener %d left", id_);
     state_ = State::Closed;
@@ -492,6 +654,7 @@ void Listener::on_control(const std::string &text) {
 }
 
 void Listener::send_ctl(const std::string &s) {
+  if (relay_) { relay_send(2, reinterpret_cast<const uint8_t *>(s.data()), s.size()); return; }
   auto dc = dc_;
   if (!dc || !dc->isOpen()) return;
   try { dc->send(s); } catch (...) {}
@@ -527,13 +690,13 @@ ListenerView Listener::view() const {
     std::lock_guard lk(mu_);
     const Plan &p = cc_.plan();
     v.name = name_;
-    v.path = rx_path_;
+    v.path = relay_ ? "relay" : rx_path_;
     v.why = p.why;
-    v.cc_state = cc_.state();
+    v.cc_state = relay_ ? "relay" : cc_.state();
     v.rtt_ms = cc_.rtt_ms() > 0 ? cc_.rtt_ms() : rx_rtt_ms_;
     v.loss = cc_.loss();
     v.queue_ms = cc_.queue_ms();
-    v.target_kbps = cc_.target_bps() / 1000.0;
+    v.target_kbps = relay_ ? double(relay_kbps_) : cc_.target_bps() / 1000.0;
     v.opus_kbps = applied_.opus_bps / 1000.0;
     v.frame_ms = applied_.frame_ms;
     v.red = caps_.red ? applied_.red : 0;

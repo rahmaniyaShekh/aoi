@@ -180,7 +180,16 @@ bool WebSocket::send(const std::string &text) {
   return true;
 }
 
-std::optional<std::string> WebSocket::receive() {
+bool WebSocket::send_binary(const void *p, size_t n) {
+  if (!ws_ || closed_) return false;
+  std::lock_guard lk(send_mu_);
+  if (closed_) return false;
+  DWORD e = WinHttpWebSocketSend(ws_, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE, (PVOID)p, DWORD(n));
+  if (e != NO_ERROR) { closed_ = true; return false; }
+  return true;
+}
+
+std::optional<std::string> WebSocket::receive(bool *binary) {
   std::string msg;
   std::vector<char> buf(8192);
   HINTERNET h = ws_;
@@ -191,8 +200,10 @@ std::optional<std::string> WebSocket::receive() {
     if (e != NO_ERROR || type == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE) { closed_ = true; break; }
     msg.append(buf.data(), got);
     if (msg.size() > (1 << 20)) { closed_ = true; break; }
-    if (type == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE || type == WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE)
+    if (type == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE || type == WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE) {
+      if (binary) *binary = type == WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE;
       return msg;
+    }
   }
   return std::nullopt;
 }

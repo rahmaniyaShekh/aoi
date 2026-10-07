@@ -48,6 +48,10 @@ const isOwner = s => typeof s === 'string' && /^[0-9a-f]{32,64}$/.test(s);
 const isBlob = s => typeof s === 'string' && s.length > 16 && s.length < MAX_BODY &&
   s.startsWith(PREFIX) && /^[A-Za-z0-9_\-:]+$/.test(s);
 const isName = s => typeof s === 'string' && s.length <= 64;
+// Capabilities a host may advertise; the listener page only tries what is here.
+const CAPS = ['relay'];
+const caps = c => Array.isArray(c) ? c.filter(x => CAPS.includes(x)) : [];
+const RELAY_MAX = 64 * 1024;
 
 async function readJson(req) {
   const raw = await req.text();
@@ -119,6 +123,7 @@ export class AoiRoom {
       mode,
       claimed: false,
       name: isName(b.name) ? b.name : '',
+      caps: caps(b.caps),
       at: Date.now(),
     };
     await this.s.put('room', room);
@@ -152,6 +157,26 @@ export class AoiRoom {
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
 
+    // Relay: when two networks cannot reach each other directly, host and
+    // listener each hold a WebSocket here, paired by the handshake session,
+    // and every message is forwarded verbatim to the other side. The payload
+    // is AES-GCM sealed with a key carried inside the code-sealed answer, so
+    // this object relays ciphertext it cannot read.
+    if (op === 'relay-ws') {
+      if (request.headers.get('upgrade') !== 'websocket') return json({ error: 'expected websocket' }, 426);
+      const session = url.searchParams.get('session'), role = url.searchParams.get('role');
+      if (!isSession(session) || (role !== 'host' && role !== 'listener')) return json({ error: 'bad request' }, 400);
+      if (role === 'host' && !(await this.checkOwner(url.searchParams.get('owner'))))
+        return json({ error: 'forbidden' }, 403);
+      const tag = `r${role[0]}:${session}`;
+      for (const old of this.ctx.getWebSockets(tag)) { try { old.close(4000, 'replaced'); } catch { } }
+      const pair = new WebSocketPair();
+      this.ctx.acceptWebSocket(pair[1], [tag]);
+      pair[1].serializeAttachment({ relay: true, role, session });
+      await this.touch();
+      return new Response(null, { status: 101, webSocket: pair[0] });
+    }
+
     if (op === 'publish') {
       const r = await this.publish(await request.json(), 'poll');
       return json(r.body, r.status);
@@ -161,7 +186,7 @@ export class AoiRoom {
       const room = await s.get('room');
       if (!room || !this.hostAlive(room)) return json({ error: 'unknown or expired code' }, 404);
       if (room.full) return json({ full: true, name: room.name });
-      return json({ offer: room.offer, session: room.session, name: room.name });
+      return json({ offer: room.offer, session: room.session, name: room.name, caps: room.caps || [] });
     }
 
     if (op === 'answer-post') {
@@ -202,9 +227,17 @@ export class AoiRoom {
 
   // --- hibernatable host socket ---------------------------------------------
   async webSocketMessage(ws, msg) {
+    const att = ws.deserializeAttachment() || {};
+    if (att.relay) {
+      const size = typeof msg === 'string' ? msg.length : msg.byteLength;
+      if (size > RELAY_MAX) return;
+      const peer = `r${att.role === 'host' ? 'l' : 'h'}:${att.session}`;
+      for (const p of this.ctx.getWebSockets(peer)) { try { p.send(msg); } catch { } }
+      return;
+    }
     if (typeof msg !== 'string' || msg.length > MAX_BODY) return;
     let m; try { m = JSON.parse(msg); } catch { return; }
-    const { owner } = ws.deserializeAttachment() || {};
+    const { owner } = att;
     const reply = o => { try { ws.send(JSON.stringify(o)); } catch { } };
 
     if (m.t === 'pub') {
@@ -212,7 +245,7 @@ export class AoiRoom {
       const room = {
         offer: m.full ? null : m.offer, session: m.full ? null : m.session,
         full: m.full === true, mode: 'ws', claimed: false,
-        name: isName(m.name) ? m.name : '', at: Date.now(),
+        name: isName(m.name) ? m.name : '', caps: caps(m.caps), at: Date.now(),
       };
       if (!room.full && (!isBlob(room.offer) || !isSession(room.session)))
         return reply({ t: 'err', error: 'bad offer', rid: m.rid });
@@ -240,6 +273,13 @@ export class AoiRoom {
   }
 
   async webSocketClose(ws) {
+    const att = ws.deserializeAttachment() || {};
+    if (att.relay) {
+      // One side of a relay left: tell the other so it reconnects promptly.
+      const peer = `r${att.role === 'host' ? 'l' : 'h'}:${att.session}`;
+      for (const p of this.ctx.getWebSockets(peer)) { try { p.close(4001, 'peer left'); } catch { } }
+      return;
+    }
     // Start the grace clock; joiners stop being handed this offer shortly.
     if (this.hosts().filter(x => x !== ws).length === 0) {
       const room = await this.s.get('room');
@@ -287,7 +327,7 @@ function secure(resp, html) {
   if (html) {
     out.headers.set('content-security-policy',
       "default-src 'none'; connect-src 'self'; media-src 'self' blob:; img-src 'self' data:; " +
-      "style-src 'unsafe-inline'; script-src 'unsafe-inline'; manifest-src 'self'; " +
+      "style-src 'unsafe-inline'; script-src 'self' 'unsafe-inline'; manifest-src 'self'; " +
       "base-uri 'none'; form-action 'none'; frame-ancestors 'none'");
     out.headers.set('permissions-policy', 'microphone=(self), screen-wake-lock=(self), autoplay=(self)');
     out.headers.set('cache-control', 'no-cache');
@@ -328,7 +368,7 @@ export default {
         return room(env, b.id, 'publish', { req: { method: 'POST', body: JSON.stringify(b) } });
       }
 
-      const m = path.match(/^\/api\/room\/([0-9a-f]{64})(\/answer|\/host)?$/);
+      const m = path.match(/^\/api\/room\/([0-9a-f]{64})(\/answer|\/host|\/relay)?$/);
       if (m) {
         const [, id, sub] = m;
         if (!sub && request.method === 'GET') {
@@ -347,6 +387,11 @@ export default {
           return env.ROOMS.get(env.ROOMS.idFromName(id))
             .fetch(new Request(`https://room/?op=host-ws&owner=${owner}`, request));
         }
+        if (sub === '/relay' && request.method === 'GET') {
+          const qs = new URLSearchParams({ op: 'relay-ws', session: url.searchParams.get('session') || '',
+            role: url.searchParams.get('role') || '', owner: url.searchParams.get('owner') || '' });
+          return env.ROOMS.get(env.ROOMS.idFromName(id)).fetch(new Request(`https://room/?${qs}`, request));
+        }
         if (sub === '/answer' && request.method === 'POST') {
           const b = await readJson(request);
           if (!b || !isBlob(b.answer) || !isSession(b.session)) return json({ error: 'bad request' }, 400);
@@ -363,7 +408,7 @@ export default {
     }
 
     // ---- static ------------------------------------------------------------
-    if (/\.(svg|png|webmanifest|ico|txt)$/.test(path)) {
+    if (/\.(svg|png|webmanifest|ico|txt|js)$/.test(path)) {
       return secure(await env.ASSETS.fetch(request), false);
     }
     // The installer is not published here (it is a private GitHub release):

@@ -27,6 +27,12 @@ std::vector<uint8_t> deflate_raw(std::string_view in);
 std::optional<std::string> inflate_raw(const uint8_t *p, size_t n, size_t limit = 1 << 20);
 
 std::string seal_blob(std::string_view sdp, std::string_view code);
+
+// Relay frames: AES-256-GCM with a 32-byte key agreed through the sealed
+// handshake. Layout: iv[12] | ciphertext | tag[16]. Byte-identical to the
+// page's WebCrypto implementation.
+std::vector<uint8_t> aead_seal(const std::vector<uint8_t> &key, const uint8_t *p, size_t n);
+std::optional<std::vector<uint8_t>> aead_open(const std::vector<uint8_t> &key, const uint8_t *p, size_t n);
 // Returns nullopt with *err = "wrong code" / "not a blob" / "corrupt".
 std::optional<std::string> open_blob(std::string_view blob, std::string_view code, std::string *err = nullptr);
 
