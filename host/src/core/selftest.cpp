@@ -2,7 +2,6 @@
 //
 //   aoi selftest              everything below
 //   aoi selftest seal CODE TEXT / open CODE BLOB   cross-implementation hooks
-#include <windows.h>
 #include <opus.h>
 
 #include <algorithm>
@@ -12,12 +11,13 @@
 #include <map>
 #include <random>
 #include <set>
+#include <thread>
 
-#include "audio.h"
 #include "cc.h"
 #include "cli.h"
 #include "crypto.h"
 #include "dsp.h"
+#include "platform/audio_system.h"
 #include "rtp.h"
 #include "talkback.h"
 #include "util.h"
@@ -319,49 +319,46 @@ void test_cc() {
 // ---------------------------------------------------------------------------------------
 void test_devices() {
   outf("\n%sAudio devices%s\n", C_BOLD, C_RST);
+  auto audio = create_audio_system();
   std::atomic<int> blocks{0};
   std::atomic<float> peak{0};
   {
-    SystemCapture cap([&](const float *x, int n) {
+    auto cap = audio->open_system_capture([&](const float *x, int n) {
       ++blocks;
       float p = 0;
       for (int i = 0; i < n * 2; ++i) p = std::max(p, std::fabs(x[i]));
       if (p > peak) peak = p;
     });
-    cap.start();
-    Sleep(1500);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
     check(blocks >= 120, "system audio capture delivers a steady clock",
-          f1("%.0f blocks in 1.5 s via ", double(blocks.load())) + (cap.process_loopback() ? "process loopback" : "endpoint loopback"));
-    cap.stop();
+          f1("%.0f blocks in 1.5 s via ", double(blocks.load())) + (cap->process_loopback() ? "process loopback" : "endpoint loopback"));
   }
   std::atomic<int> mic_frames{0};
   {
-    MicCapture mic([&](const float *, int n) { mic_frames += n; });
-    mic.start();
-    Sleep(1500);
+    auto mic = audio->open_mic("", [&](const float *, int n) { mic_frames += n; });
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
     bool ok = mic_frames > kRate / 2;
     check(true, ok ? "microphone delivers audio" : "no microphone (music only; that is fine)",
-          ok ? mic.name() : std::string());
-    mic.stop();
+          ok ? mic->status().device_name : std::string());
   }
 }
 
 }  // namespace
 
-int run_selftest(const std::vector<std::wstring> &args) {
-  if (args.size() >= 3 && args[0] == L"seal") {
-    out(seal_blob(narrow(args[2]), normalize_code(narrow(args[1]))) + "\n");
+int run_selftest(const std::vector<std::string> &args) {
+  if (args.size() >= 3 && args[0] == "seal") {
+    out(seal_blob(args[2], normalize_code(args[1])) + "\n");
     return 0;
   }
-  if (args.size() >= 3 && args[0] == L"open") {
+  if (args.size() >= 3 && args[0] == "open") {
     std::string err;
-    auto s = open_blob(narrow(args[2]), normalize_code(narrow(args[1])), &err);
+    auto s = open_blob(args[2], normalize_code(args[1]), &err);
     if (!s) { out("ERROR " + err + "\n"); return 1; }
     out(*s);
     return 0;
   }
   bool quick = false;
-  for (auto &a : args) { if (a == L"--no-devices") quick = true; if (a == L"--trace") g_trace = true; }
+  for (auto &a : args) { if (a == "--no-devices") quick = true; if (a == "--trace") g_trace = true; }
   outf("\n%sAOI self test%s %s\n", C_BOLD, C_RST, AOI_VERSION);
   test_crypto();
   test_rtp();

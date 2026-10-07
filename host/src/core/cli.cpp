@@ -1,17 +1,16 @@
 #include "cli.h"
 
-#include <windows.h>
-#include <objbase.h>
-
 #include <qrcodegen.hpp>
 #include <nlohmann/json.hpp>
 
+#include <condition_variable>
 #include <cstdarg>
 #include <fstream>
+#include <thread>
 
 #include "control.h"
 #include "engine.h"
-#include "install.h"
+#include "platform/installer.h"
 #include "util.h"
 
 using json = nlohmann::json;
@@ -20,28 +19,12 @@ namespace aoi {
 
 const char *C_DIM = "\x1b[2m", *C_BOLD = "\x1b[1m", *C_ACC = "\x1b[38;5;141m", *C_OK = "\x1b[32m",
            *C_WARN = "\x1b[33m", *C_BAD = "\x1b[31m", *C_RST = "\x1b[0m";
-static bool g_console_out = false;
 
 void con_init() {
-  SetConsoleOutputCP(CP_UTF8);
-  HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
-  DWORD mode = 0;
-  g_console_out = GetConsoleMode(h, &mode) != 0;
-  if (!g_console_out || !SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING))
-    C_DIM = C_BOLD = C_ACC = C_OK = C_WARN = C_BAD = C_RST = "";
+  if (!console_init()) C_DIM = C_BOLD = C_ACC = C_OK = C_WARN = C_BAD = C_RST = "";
 }
 
-void out(const std::string &s) {
-  HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
-  if (g_console_out) {
-    std::wstring w = widen(s);
-    DWORD n;
-    WriteConsoleW(h, w.data(), DWORD(w.size()), &n, nullptr);
-  } else {
-    fwrite(s.data(), 1, s.size(), stdout);
-    fflush(stdout);
-  }
-}
+void out(const std::string &s) { console_write(s); }
 
 void outf(const char *fmt, ...) {
   char buf[4096];
@@ -76,6 +59,8 @@ void print_qr(const std::string &text) {
 
 // ---------------------------------------------------------------------------------------
 namespace {
+
+void nap_ms(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
 
 std::optional<json> status_now(int timeout = 1500) {
   auto r = control_call({{"cmd", "status"}}, timeout);
@@ -158,63 +143,71 @@ void print_status(const json &st) {
   outf("\n");
 }
 
-std::vector<std::wstring> passthrough(const std::vector<std::wstring> &args) {
-  std::vector<std::wstring> o;
+std::vector<std::string> passthrough(const std::vector<std::string> &args) {
+  std::vector<std::string> o;
   for (size_t i = 0; i < args.size(); ++i) {
-    const std::wstring &a = args[i];
-    if ((a == L"--simulate" || a == L"--service") && i + 1 < args.size()) { o.push_back(a); o.push_back(args[++i]); }
-    else if (a == L"--new-code" || a == L"--verbose") o.push_back(a);
+    const std::string &a = args[i];
+    if ((a == "--simulate" || a == "--service") && i + 1 < args.size()) { o.push_back(a); o.push_back(args[++i]); }
+    else if (a == "--new-code" || a == "--verbose") o.push_back(a);
   }
   return o;
 }
 
-void apply_flags(Settings &s, const std::vector<std::wstring> &args) {
+void apply_flags(Settings &s, const std::vector<std::string> &args) {
   for (size_t i = 0; i < args.size(); ++i) {
-    const std::wstring &a = args[i];
-    if (a == L"--simulate" && i + 1 < args.size()) {
-      if (!parse_netsim(narrow(args[++i]), s.sim)) LOGW("bad --simulate spec");
-    } else if (a == L"--service" && i + 1 < args.size()) {
-      s.service = narrow(args[++i]);
-    } else if (a == L"--new-code") {
+    const std::string &a = args[i];
+    if (a == "--simulate" && i + 1 < args.size()) {
+      if (!parse_netsim(args[++i], s.sim)) LOGW("bad --simulate spec");
+    } else if (a == "--service" && i + 1 < args.size()) {
+      s.service = args[++i];
+    } else if (a == "--new-code") {
       s.new_code = true;
-    } else if (a == L"--verbose") {
+    } else if (a == "--verbose") {
       g_verbose = true;
     }
   }
 }
 
-HANDLE g_stop_event = nullptr;
-BOOL WINAPI on_ctrl(DWORD) {
-  if (g_stop_event) SetEvent(g_stop_event);
-  return TRUE;
-}
+// Set once to make serve() return.
+struct StopSignal {
+  std::mutex mu;
+  std::condition_variable cv;
+  bool set = false;
+  void fire() {
+    { std::lock_guard lk(mu); set = true; }
+    cv.notify_all();
+  }
+  bool wait_for(int ms) {
+    std::unique_lock lk(mu);
+    return cv.wait_for(lk, std::chrono::milliseconds(ms), [&] { return set; });
+  }
+};
+StopSignal g_stop;
 
 // The host itself, in this process: detached (daemon) or in the terminal (run).
-int serve(const std::vector<std::wstring> &args, bool foreground) {
-  HANDLE mutex = CreateMutexW(nullptr, TRUE, L"Local\\aoi-host-instance");
-  if (GetLastError() == ERROR_ALREADY_EXISTS) {
+int serve(const std::vector<std::string> &args, bool foreground) {
+  auto lock = acquire_instance_lock("aoi-host-instance");
+  if (!lock) {
     if (foreground) out("AOI is already running in the background. Use: aoi status / aoi stop\n");
     return 0;
   }
-  log_init(data_dir() / L"aoi.log", foreground);
+  log_init(data_dir() / "aoi.log", foreground);
   Settings s;  // fixed best-outcome defaults; nothing to configure
   apply_flags(s, args);
-  LOGI("aoi %s starting (pid %lu)%s", AOI_VERSION, GetCurrentProcessId(), foreground ? " in foreground" : "");
+  LOGI("aoi %s starting (pid %d)%s", AOI_VERSION, current_pid(), foreground ? " in foreground" : "");
   if (s.sim.active()) LOGW("network simulator active: %s", s.sim.describe().c_str());
-  write_file_atomic(data_dir() / L"aoi.pid", std::to_string(GetCurrentProcessId()));
+  write_file_atomic(data_dir() / "aoi.pid", std::to_string(current_pid()));
   cleanup_old_copies();  // leftovers from an update, unlocked now
-  CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-  g_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-  SetConsoleCtrlHandler(on_ctrl, TRUE);
+  on_interrupt([] { g_stop.fire(); });
 
   Engine engine(s);
   engine.start();
-  ControlServer ctl(engine, [] { SetEvent(g_stop_event); });
+  ControlServer ctl(engine, [] { g_stop.fire(); });
   ctl.start();
 
   if (foreground) {
     bool shown = false;
-    while (WaitForSingleObject(g_stop_event, 250) == WAIT_TIMEOUT) {
+    while (!g_stop.wait_for(250)) {
       if (!shown && engine.snapshot().published) {
         shown = true;
         print_banner(snapshot_json(engine.snapshot()));
@@ -222,22 +215,22 @@ int serve(const std::vector<std::wstring> &args, bool foreground) {
       }
     }
   } else {
-    WaitForSingleObject(g_stop_event, INFINITE);
+    while (!g_stop.wait_for(60000)) {
+    }
   }
   LOGI("stopping");
   // A clean stop takes about a second (listeners told, code withdrawn). If
   // anything below ever wedges, still exit promptly: `aoi stop` must stop.
   std::thread([] {
-    Sleep(4000);
+    nap_ms(4000);
     LOGW("shutdown took too long; exiting");
-    ExitProcess(0);
+    hard_exit(0);
   }).detach();
   ctl.stop();
   engine.stop();
   std::error_code ec;
-  std::filesystem::remove(data_dir() / L"aoi.pid", ec);
+  std::filesystem::remove(data_dir() / "aoi.pid", ec);
   LOGI("stopped");
-  CloseHandle(mutex);
   return 0;
 }
 
@@ -253,24 +246,23 @@ std::vector<std::string> tail_lines(const std::filesystem::path &p, size_t n) {
   return lines;
 }
 
-DWORD daemon_pid() {
+int daemon_pid() {
   std::string s;
-  if (!read_file(data_dir() / L"aoi.pid", s)) return 0;
-  return DWORD(strtoul(s.c_str(), nullptr, 10));
+  if (!read_file(data_dir() / "aoi.pid", s)) return 0;
+  return int(strtoul(s.c_str(), nullptr, 10));
 }
 
 }  // namespace
 
 // ---------------------------------------------------------------------------------------
-int cmd_daemon(const std::vector<std::wstring> &args) {
-  // Started from the Run key a console exe gets a console window: drop it.
-  FreeConsole();
+int cmd_daemon(const std::vector<std::string> &args) {
+  detach_console();
   return serve(args, false);
 }
 
-int cmd_run(const std::vector<std::wstring> &args) { return serve(args, true); }
+int cmd_run(const std::vector<std::string> &args) { return serve(args, true); }
 
-int cmd_start(const std::vector<std::wstring> &args) {
+int cmd_start(const std::vector<std::string> &args) {
   if (auto st = status_now()) {
     if (st->value("published", false)) {
       print_banner(*st);
@@ -279,30 +271,29 @@ int cmd_start(const std::vector<std::wstring> &args) {
     }
     return 0;
   }
-  std::wstring cmdline = L"\"" + exe_path().wstring() + L"\" daemon";
-  for (auto &a : passthrough(args)) cmdline += L" \"" + a + L"\"";
-  STARTUPINFOW si{sizeof si};
-  PROCESS_INFORMATION pi{};
-  if (!CreateProcessW(nullptr, cmdline.data(), nullptr, nullptr, FALSE,
-                      DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW, nullptr, data_dir().c_str(), &si, &pi)) {
-    outf("%scould not start the background process: %s%s\n", C_BAD, hr_text(long(HRESULT_FROM_WIN32(GetLastError()))).c_str(), C_RST);
+  std::vector<std::string> argv = {narrow(exe_path().wstring()), "daemon"};
+  for (auto &a : passthrough(args)) argv.push_back(a);
+  SpawnOptions opt;
+  opt.background = true;
+  opt.cwd = data_dir();
+  std::string err;
+  auto proc = spawn(argv, opt, &err);
+  if (!proc) {
+    outf("%scould not start the background process: %s%s\n", C_BAD, err.c_str(), C_RST);
     return 1;
   }
-  CloseHandle(pi.hThread);
   out("  Starting AOI");
   int64_t until = now_us() + 40000000;
   std::string last_status;
   while (now_us() < until) {
-    if (WaitForSingleObject(pi.hProcess, 300) == WAIT_OBJECT_0) {
-      CloseHandle(pi.hProcess);
+    if (proc->wait(300)) {
       if (auto st = status_now()) { print_banner(*st); return 0; }  // another instance won the race
       outf("\n%sAOI exited during startup. Last log lines:%s\n", C_BAD, C_RST);
-      for (auto &l : tail_lines(data_dir() / L"aoi.log", 12)) outf("    %s\n", l.c_str());
+      for (auto &l : tail_lines(data_dir() / "aoi.log", 12)) outf("    %s\n", l.c_str());
       return 1;
     }
     auto st = status_now(800);
     if (st && st->value("published", false)) {
-      CloseHandle(pi.hProcess);
       out("\r              \r");
       print_banner(*st);
       return 0;
@@ -312,7 +303,6 @@ int cmd_start(const std::vector<std::wstring> &args) {
     }
     out(".");
   }
-  CloseHandle(pi.hProcess);
   outf("\n  %sStill connecting (%s). It keeps trying in the background; check with: aoi status%s\n", C_WARN,
        last_status.c_str(), C_RST);
   return 0;
@@ -320,25 +310,24 @@ int cmd_start(const std::vector<std::wstring> &args) {
 
 int cmd_stop() {
   auto st = status_now();
-  DWORD pid = st ? DWORD(st->value("pid", 0)) : daemon_pid();
-  HANDLE proc = pid ? OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, pid) : nullptr;
+  int pid = st ? st->value("pid", 0) : daemon_pid();
+  auto proc = open_process(pid);
   if (!st && !proc) { out("AOI is not running.\n"); return 0; }
   if (st) control_call({{"cmd", "stop"}}, 2000);
   if (proc) {
     // Graceful first (listeners are told, the code is withdrawn), then force.
-    if (WaitForSingleObject(proc, 6000) != WAIT_OBJECT_0) {
-      TerminateProcess(proc, 1);
-      WaitForSingleObject(proc, 2000);
+    if (!proc->wait(6000)) {
+      proc->terminate();
+      proc->wait(2000);
       out("AOI stopped (forced).\n");
     } else {
       out("AOI stopped.\n");
     }
-    CloseHandle(proc);
   } else {
     out("AOI stopped.\n");
   }
   std::error_code ec;
-  std::filesystem::remove(data_dir() / L"aoi.pid", ec);
+  std::filesystem::remove(data_dir() / "aoi.pid", ec);
   return 0;
 }
 
@@ -352,7 +341,7 @@ int cmd_status(bool watch, bool as_json) {
     if (as_json) { out(st->dump(2) + "\n"); return 0; }
     if (watch) out("\x1b[H\x1b[2J");
     print_status(*st);
-    if (watch) Sleep(1000);
+    if (watch) nap_ms(1000);
   } while (watch);
   return 0;
 }
@@ -368,13 +357,13 @@ int cmd_code() {
 }
 
 int cmd_logs(bool follow) {
-  auto path = data_dir() / L"aoi.log";
+  auto path = data_dir() / "aoi.log";
   for (auto &l : tail_lines(path, 60)) outf("%s\n", l.c_str());
   if (!follow) return 0;
   std::error_code ec;
   uintmax_t pos = std::filesystem::file_size(path, ec);
   for (;;) {
-    Sleep(500);
+    nap_ms(500);
     uintmax_t sz = std::filesystem::file_size(path, ec);
     if (ec) continue;
     if (sz < pos) pos = 0;  // rotated
@@ -393,14 +382,14 @@ int cmd_new_code() {
   if (control_call({{"cmd", "new-code"}})) {
     out("New code requested. Everyone on the old code is disconnected.\n");
     for (int i = 0; i < 40; ++i) {
-      Sleep(250);
+      nap_ms(250);
       auto st = status_now();
       if (st && st->value("published", false)) { print_banner(*st); return 0; }
     }
     return 0;
   }
   std::error_code ec;
-  std::filesystem::remove(data_dir() / L"host.json", ec);
+  std::filesystem::remove(data_dir() / "host.json", ec);
   out("AOI is not running; a new code will be made when it starts.\n");
   return 0;
 }
@@ -419,61 +408,45 @@ int cmd_install(bool start_after) {
   outf("\n  %sAOI installed%s to %s\n", C_OK, C_RST, narrow(install_dir().wstring()).c_str());
   out("  `aoi` now works in any new terminal: aoi start / aoi status / aoi stop\n");
   if (start_after) {
-    std::wstring cmd = L"\"" + installed_exe().wstring() + L"\" start";
-    STARTUPINFOW si{sizeof si};
-    PROCESS_INFORMATION pi{};
-    if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi)) {
-      WaitForSingleObject(pi.hProcess, 60000);
-      CloseHandle(pi.hThread);
-      CloseHandle(pi.hProcess);
-    }
+    if (auto p = spawn({narrow(installed_exe().wstring()), "start"}, {})) p->wait(60000);
   }
   return 0;
 }
 
 // Fetches the latest release with the GitHub CLI (the repository is private)
 // and installs it over this one; a running host is restarted on the new build.
-int cmd_update(const std::wstring &from) {
-  wchar_t tmp[MAX_PATH];
-  GetTempPathW(MAX_PATH, tmp);
-  std::filesystem::path dir = std::filesystem::path(tmp) / (L"aoi-update-" + widen(random_hex(4)));
+int cmd_update(const std::string &from) {
   std::error_code ec;
+  std::filesystem::path dir = std::filesystem::temp_directory_path(ec) / ("aoi-update-" + random_hex(4));
   std::filesystem::create_directories(dir, ec);
-  auto exe = dir / L"aoi.exe";
-  STARTUPINFOW si{sizeof si};
-  DWORD code = 1;
+  auto exe = dir / release_asset_name();
   if (!from.empty()) {
     // `aoi update --from <file>`: install a local build exactly the way a
     // downloaded release is installed (offline machines, and testing).
-    if (!CopyFileW(from.c_str(), exe.c_str(), FALSE)) { outf("%s  Cannot read that file%s\n", C_BAD, C_RST); return 1; }
+    std::filesystem::copy_file(std::filesystem::path(widen(from)), exe, std::filesystem::copy_options::overwrite_existing,
+                               ec);
+    if (ec) { outf("%s  Cannot read that file%s\n", C_BAD, C_RST); return 1; }
   } else {
     outf("  Downloading the latest AOI release...\n");
-    std::wstring cmd = L"gh release download -R rahmaniyaShekh/aoi -p aoi.exe --clobber -D \"" + dir.wstring() + L"\"";
-    PROCESS_INFORMATION pi{};
-    if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi)) {
-      WaitForSingleObject(pi.hProcess, 300000);
-      GetExitCodeProcess(pi.hProcess, &code);
-      CloseHandle(pi.hThread);
-      CloseHandle(pi.hProcess);
-    } else {
+    auto gh = spawn({"gh", "release", "download", "-R", "rahmaniyaShekh/aoi", "-p", release_asset_name(), "--clobber",
+                     "-D", narrow(dir.wstring())},
+                    {});
+    if (!gh) {
       outf("%s  The GitHub CLI is needed: winget install --id GitHub.cli, then gh auth login%s\n", C_BAD, C_RST);
       return 1;
     }
+    int code = gh->wait(300000) ? gh->exit_code() : 1;
     if (code != 0 || !std::filesystem::exists(exe, ec)) {
       outf("%s  Download failed (logged in with gh, with access to the repository?)%s\n", C_BAD, C_RST);
       return 1;
     }
   }
   // The new exe installs itself (stopping this one if it runs) and starts.
-  std::wstring inst = L"\"" + exe.wstring() + L"\" install";
-  PROCESS_INFORMATION p2{};
-  if (!CreateProcessW(nullptr, inst.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &p2)) return 1;
-  WaitForSingleObject(p2.hProcess, 120000);
-  GetExitCodeProcess(p2.hProcess, &code);
-  CloseHandle(p2.hThread);
-  CloseHandle(p2.hProcess);
+  auto inst = spawn({narrow(exe.wstring()), "install"}, {});
+  if (!inst) return 1;
+  int code = inst->wait(120000) ? inst->exit_code() : 1;
   std::filesystem::remove_all(dir, ec);
-  return int(code);
+  return code;
 }
 
 int cmd_uninstall(bool purge) {
@@ -507,6 +480,46 @@ int cmd_help() {
       "    Each listener sets their own music/voice balance on their page.\n"
       "    Listeners open the link in a browser - no app, no account. Up to 2 at a time.\n\n");
   return 0;
+}
+
+// ---------------------------------------------------------------------------------------
+int aoi_main(const std::vector<std::string> &args) {
+  con_init();
+  std::string cmd = args.empty() ? "start" : args[0];
+  std::vector<std::string> rest(args.empty() ? args.begin() : args.begin() + 1, args.end());
+  // `aoi --simulate ...` is `aoi start --simulate ...`
+  if (!cmd.empty() && cmd[0] == '-' && cmd != "-h" && cmd != "--help" && cmd != "--version") {
+    rest = args;
+    cmd = "start";
+  }
+  auto flag = [&](const char *f) {
+    for (auto &a : rest) if (a == f) return true;
+    return false;
+  };
+  auto arg = [&](size_t i) { return i < rest.size() ? rest[i] : std::string(); };
+
+  if (cmd == "start") return cmd_start(rest);
+  if (cmd == "run") return cmd_run(rest);
+  if (cmd == "daemon") return cmd_daemon(rest);
+  if (cmd == "stop" || cmd == "kill") return cmd_stop();
+  if (cmd == "restart") { cmd_stop(); return cmd_start(rest); }
+  if (cmd == "status") return cmd_status(flag("--watch") || flag("-w"), flag("--json"));
+  if (cmd == "code" || cmd == "link" || cmd == "qr") return cmd_code();
+  if (cmd == "logs" || cmd == "log") return cmd_logs(flag("-f") || flag("--follow"));
+  if (cmd == "new-code") return cmd_new_code();
+  if (cmd == "kick") return cmd_kick(atoi(arg(0).c_str()));
+  if (cmd == "install") return cmd_install(!flag("--no-start"));
+  if (cmd == "uninstall") return cmd_uninstall(flag("--purge"));
+  if (cmd == "update" || cmd == "upgrade") {
+    std::string from;
+    for (size_t i = 0; i + 1 < rest.size(); ++i) if (rest[i] == "--from") from = rest[i + 1];
+    return cmd_update(from);
+  }
+  if (cmd == "selftest") return run_selftest(rest);
+  if (cmd == "version" || cmd == "--version") { outf("aoi %s\n", AOI_VERSION); return 0; }
+  if (cmd == "help" || cmd == "-h" || cmd == "--help") return cmd_help();
+  outf("unknown command '%s'. Try: aoi help\n", cmd.c_str());
+  return 2;
 }
 
 }  // namespace aoi

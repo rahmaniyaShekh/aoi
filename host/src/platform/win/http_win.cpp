@@ -1,9 +1,15 @@
-#include "http.h"
+// platform/http.h on Windows: WinHTTP.
+#include "platform/http.h"
+
+#include <windows.h>
+#include <winhttp.h>
 
 #include <algorithm>
+#include <atomic>
+#include <mutex>
 #include <vector>
 
-#include "util.h"
+#include "platform/os.h"
 
 namespace aoi {
 
@@ -48,15 +54,41 @@ std::string err_text(DWORD e) {
     default: return "winhttp error " + std::to_string(e);
   }
 }
+class WinWebSocket final : public WebSocket {
+ public:
+  ~WinWebSocket() override;
+  bool send(const std::string &text) override;
+  bool send_binary(const void *p, size_t n) override;
+  std::optional<std::string> receive(bool *binary) override;
+  void close() override;
+  bool open() const override { return ws_ != nullptr && !closed_; }
+
+  HINTERNET conn_ = nullptr, req_ = nullptr, ws_ = nullptr;
+
+ private:
+  std::mutex send_mu_;
+  std::atomic<bool> closed_{false};
+  bool handle_closed_ = false;
+};
 }  // namespace
 
-Http::Http() = default;
+struct Http::Impl {
+  // A direct session first; the auto-proxy session only if direct cannot
+  // connect. WPAD discovery can stall the first request by ~8 s on networks
+  // without a WPAD server, so it is never the first thing tried.
+  HINTERNET session(bool proxy);
+  HINTERNET direct_ = nullptr, proxied_ = nullptr;
+  std::mutex mu_;
+  std::atomic<int> prefer_proxy_{-1};  // -1 unknown, 0 direct worked, 1 proxy worked
+};
+
+Http::Http() : impl_(std::make_unique<Impl>()) {}
 Http::~Http() {
-  if (direct_) WinHttpCloseHandle(direct_);
-  if (proxied_) WinHttpCloseHandle(proxied_);
+  if (impl_->direct_) WinHttpCloseHandle(impl_->direct_);
+  if (impl_->proxied_) WinHttpCloseHandle(impl_->proxied_);
 }
 
-HINTERNET Http::session(bool proxy) {
+HINTERNET Http::Impl::session(bool proxy) {
   std::lock_guard lk(mu_);
   HINTERNET &h = proxy ? proxied_ : direct_;
   if (!h) {
@@ -76,13 +108,14 @@ HttpResult Http::request(const std::string &method, const std::string &url, cons
   Url u;
   if (!crack(url, u)) { res.error = "bad url"; return res; }
 
-  int pref = prefer_proxy_.load();
+  Impl &m = *impl_;
+  int pref = m.prefer_proxy_.load();
   // direct, direct again (a fresh connection often lands on the other
   // address), then the system proxy
   bool order[3] = {pref == 1, pref == 1, pref != 1};
   for (int attempt = 0; attempt < 3; ++attempt) {
     bool proxy = order[attempt];
-    HINTERNET s = session(proxy);
+    HINTERNET s = m.session(proxy);
     if (!s) continue;
     HINTERNET c = WinHttpConnect(s, u.host.c_str(), u.port, 0);
     if (!c) continue;
@@ -118,7 +151,7 @@ HttpResult Http::request(const std::string &method, const std::string &url, cons
       if (res.body.size() > (1 << 20)) break;
     }
     WinHttpCloseHandle(r); WinHttpCloseHandle(c);
-    prefer_proxy_ = proxy ? 1 : 0;
+    m.prefer_proxy_ = proxy ? 1 : 0;
     res.error.clear();
     return res;
   }
@@ -128,13 +161,14 @@ HttpResult Http::request(const std::string &method, const std::string &url, cons
 std::unique_ptr<WebSocket> Http::websocket(const std::string &url, int timeout_ms, std::string *err) {
   Url u;
   if (!crack(url, u)) { if (err) *err = "bad url"; return nullptr; }
-  int pref = prefer_proxy_.load();
+  Impl &m = *impl_;
+  int pref = m.prefer_proxy_.load();
   bool order[2] = {pref == 1, pref != 1};
   for (int attempt = 0; attempt < 2; ++attempt) {
     bool proxy = order[attempt];
-    HINTERNET s = session(proxy);
+    HINTERNET s = m.session(proxy);
     if (!s) continue;
-    auto ws = std::make_unique<WebSocket>();
+    auto ws = std::make_unique<WinWebSocket>();
     ws->conn_ = WinHttpConnect(s, u.host.c_str(), u.port, 0);
     if (!ws->conn_) continue;
     ws->req_ = WinHttpOpenRequest(ws->conn_, L"GET", u.path.c_str(), nullptr, WINHTTP_NO_REFERER,
@@ -157,7 +191,7 @@ std::unique_ptr<WebSocket> Http::websocket(const std::string &url, int timeout_m
     if (!ws->ws_) { if (err) *err = err_text(GetLastError()); return nullptr; }
     WinHttpCloseHandle(ws->req_);
     ws->req_ = nullptr;
-    prefer_proxy_ = proxy ? 1 : 0;
+    m.prefer_proxy_ = proxy ? 1 : 0;
     return ws;
   }
   if (err && err->empty()) *err = "cannot connect";
@@ -165,13 +199,13 @@ std::unique_ptr<WebSocket> Http::websocket(const std::string &url, int timeout_m
 }
 
 // ---- WebSocket -------------------------------------------------------------------
-WebSocket::~WebSocket() {
+WinWebSocket::~WinWebSocket() {
   close();
   if (req_) WinHttpCloseHandle(req_);
   if (conn_) WinHttpCloseHandle(conn_);
 }
 
-bool WebSocket::send(const std::string &text) {
+bool WinWebSocket::send(const std::string &text) {
   if (!ws_ || closed_) return false;
   std::lock_guard lk(send_mu_);
   DWORD e = WinHttpWebSocketSend(ws_, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (PVOID)text.data(),
@@ -180,7 +214,7 @@ bool WebSocket::send(const std::string &text) {
   return true;
 }
 
-bool WebSocket::send_binary(const void *p, size_t n) {
+bool WinWebSocket::send_binary(const void *p, size_t n) {
   if (!ws_ || closed_) return false;
   std::lock_guard lk(send_mu_);
   if (closed_) return false;
@@ -189,7 +223,7 @@ bool WebSocket::send_binary(const void *p, size_t n) {
   return true;
 }
 
-std::optional<std::string> WebSocket::receive(bool *binary) {
+std::optional<std::string> WinWebSocket::receive(bool *binary) {
   std::string msg;
   std::vector<char> buf(8192);
   HINTERNET h = ws_;
@@ -208,7 +242,7 @@ std::optional<std::string> WebSocket::receive(bool *binary) {
   return std::nullopt;
 }
 
-void WebSocket::close() {
+void WinWebSocket::close() {
   if (!ws_) return;
   bool was = closed_.exchange(true);
   if (!was) WinHttpWebSocketShutdown(ws_, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, nullptr, 0);

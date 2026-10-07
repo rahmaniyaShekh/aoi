@@ -1,4 +1,5 @@
-// Small shared helpers: clocks, logging, paths, strings, randomness.
+// Small shared helpers: logging, files, strings, randomness, byte order.
+// Clocks, paths and the like come from the platform (platform/os.h).
 #pragma once
 #include <atomic>
 #include <cstdint>
@@ -9,14 +10,9 @@
 #include <string_view>
 #include <vector>
 
-namespace aoi {
+#include "platform/os.h"
 
-// ---- time ------------------------------------------------------------------
-// Monotonic, high resolution (QueryPerformanceCounter).
-int64_t now_us();
-inline double now_s() { return now_us() * 1e-6; }
-// Wall clock as a 64-bit NTP timestamp (RTCP sender reports).
-uint64_t ntp_now();
+namespace aoi {
 
 // ---- logging ---------------------------------------------------------------
 enum class Level { Debug, Info, Warn, Error };
@@ -28,22 +24,15 @@ void log_write(Level lv, const char *fmt, ...) __attribute__((format(gnu_printf,
 #define LOGE(...) ::aoi::log_write(::aoi::Level::Error, __VA_ARGS__)
 extern std::atomic<bool> g_verbose;
 
-// ---- paths & strings -------------------------------------------------------
-std::filesystem::path data_dir();       // %LOCALAPPDATA%\AOI, created on demand
-std::filesystem::path exe_path();
-std::wstring widen(std::string_view s);
-std::string narrow(std::wstring_view s);
-std::string computer_name();
-std::string hr_text(long hr);           // "0x80070005 (Access is denied.)"
-
 // ---- bytes -----------------------------------------------------------------
-bool random_bytes(void *out, size_t n);  // OS CSPRNG (BCryptGenRandom)
 std::string random_hex(size_t bytes);
 std::string to_hex(const uint8_t *p, size_t n);
 uint32_t random_u32();
 
 bool read_file(const std::filesystem::path &p, std::string &out);
 bool write_file_atomic(const std::filesystem::path &p, const std::string &data);
+
+std::string lower_ascii(std::string s);
 
 inline void put_be16(uint8_t *p, uint16_t v) { p[0] = uint8_t(v >> 8); p[1] = uint8_t(v); }
 inline void put_be24(uint8_t *p, uint32_t v) { p[0] = uint8_t(v >> 16); p[1] = uint8_t(v >> 8); p[2] = uint8_t(v); }

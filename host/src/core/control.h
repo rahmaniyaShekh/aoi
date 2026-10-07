@@ -1,20 +1,21 @@
 // Local control of the background host: the `aoi` commands talk to the
-// detached daemon over a per-user named pipe, one JSON request per call.
+// detached daemon over the platform's IPC channel (platform/ipc.h), one JSON
+// request per call.
 #pragma once
-#include <atomic>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
-#include <thread>
 
 #include <nlohmann/json.hpp>
+
+#include "platform/ipc.h"
 
 namespace aoi {
 
 class Engine;
 struct Snapshot;
 
-std::wstring pipe_name();
 nlohmann::json snapshot_json(const Snapshot &s);
 
 class ControlServer {
@@ -25,13 +26,10 @@ class ControlServer {
   void stop();
 
  private:
-  void run();
   std::string handle(const std::string &req);
   Engine &engine_;
   std::function<void()> on_stop_;
-  std::thread thread_;
-  std::atomic<bool> stop_{false};
-  void *stop_event_ = nullptr;
+  std::unique_ptr<IpcServer> ipc_;
 };
 
 // Client side. nullopt when no daemon is listening.

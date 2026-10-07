@@ -1,8 +1,5 @@
 #include "netsim.h"
 
-#include <windows.h>
-#include <mmsystem.h>
-
 #include <algorithm>
 #include <cstdio>
 #include <sstream>
@@ -39,7 +36,7 @@ bool parse_netsim(const std::string &s, NetSimConfig &c) {
 
 NetSim::NetSim(NetSimConfig cfg, Deliver d) : cfg_(cfg), deliver_(std::move(d)) {
   rng_ = (uint64_t(random_u32()) << 32) | random_u32() | 1;
-  timeBeginPeriod(1);
+  fine_timer(true);
   thread_ = std::thread([this] { run(); });
 }
 
@@ -47,7 +44,7 @@ NetSim::~NetSim() {
   { std::lock_guard lk(mu_); stop_ = true; }
   cv_.notify_all();
   if (thread_.joinable()) thread_.join();
-  timeEndPeriod(1);
+  fine_timer(false);
 }
 
 double NetSim::rnd() {  // xorshift64*

@@ -1,11 +1,12 @@
-#include "install.h"
+// platform/installer.h on Windows.
+#include "platform/installer.h"
 
 #include <windows.h>
 #include <shlobj.h>
 
 #include <algorithm>
 
-#include "util.h"
+#include "core/util.h"
 
 namespace aoi {
 
@@ -111,7 +112,7 @@ bool install(std::string *err) {
       }
     }
     if (!ok) {
-      if (err) *err = "could not copy to " + narrow(install_dir().wstring()) + ": " + hr_text(long(HRESULT_FROM_WIN32(e)));
+      if (err) *err = "could not copy to " + narrow(install_dir().wstring()) + ": " + os_error_text(long(HRESULT_FROM_WIN32(e)));
       return false;
     }
     if (!old.empty() && !DeleteFileW(old.c_str())) MoveFileExW(old.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
@@ -182,5 +183,7 @@ void set_autostart(bool on) {
   }
   RegCloseKey(k);
 }
+
+std::string release_asset_name() { return "aoi.exe"; }
 
 }  // namespace aoi

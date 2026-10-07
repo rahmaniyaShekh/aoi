@@ -364,7 +364,7 @@ void Listener::push(std::shared_ptr<const SourceBlock> b) {
 }
 
 void Listener::sender_loop() {
-  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+  raise_thread_priority();
   for (;;) {
     std::shared_ptr<const SourceBlock> b;
     {

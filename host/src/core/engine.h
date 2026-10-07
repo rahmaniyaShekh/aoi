@@ -8,7 +8,7 @@
 #include <thread>
 #include <vector>
 
-#include "audio.h"
+#include "platform/audio_system.h"
 #include "dsp.h"
 #include "listener.h"
 #include "netsim.h"
@@ -66,9 +66,9 @@ class Engine {
   void set_status(const std::string &s, const std::string &err = {});
 
   Settings settings_;
-  std::unique_ptr<SystemCapture> capture_;
-  std::unique_ptr<MicCapture> mic_;
-  std::unique_ptr<Render> render_;
+  std::unique_ptr<IAudioSystem> audio_;
+  std::unique_ptr<SystemCaptureStream> capture_;
+  std::unique_ptr<AudioStream> mic_, render_;
   DriftReader mic_reader_{kRate * 2};
   VoiceChain voice_;
   AutoLevel level_;

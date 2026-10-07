@@ -25,7 +25,7 @@ Engine::Engine(Settings s) : settings_(std::move(s)) {
 Engine::~Engine() { stop(); }
 
 bool Engine::load_identity(bool fresh) {
-  auto path = data_dir() / L"host.json";
+  auto path = data_dir() / "host.json";
   std::string s;
   if (!fresh && read_file(path, s)) {
     json j = json::parse(s, nullptr, false);
@@ -46,11 +46,10 @@ bool Engine::load_identity(bool fresh) {
 void Engine::start() {
   if (running_.exchange(true)) return;
   load_identity(settings_.new_code);
-  capture_ = std::make_unique<SystemCapture>([this](const float *x, int n) { on_system(x, n); });
-  capture_->start();
+  audio_ = create_audio_system();
+  capture_ = audio_->open_system_capture([this](const float *x, int n) { on_system(x, n); });
   if (settings_.mic) set_mic(true);
-  render_ = std::make_unique<Render>([this](float *x, int n) { render_pull(x, n); });
-  if (settings_.talkback) render_->start();
+  if (settings_.talkback) render_ = audio_->open_render("", [this](float *x, int n) { render_pull(x, n); });
   host_thread_ = std::thread([this] { host_loop(); });
   house_thread_ = std::thread([this] { housekeeping(); });
 }
@@ -73,9 +72,9 @@ void Engine::stop() {
   }
   LOGD("stop: listeners closed");
   if (rdv_) { rdv_->withdraw(); LOGD("stop: withdrawn"); rdv_->stop(); LOGD("stop: rendezvous closed"); }
-  if (capture_) capture_->stop();
-  if (mic_) mic_->stop();
-  if (render_) render_->stop();
+  capture_.reset();
+  mic_.reset();
+  render_.reset();
 }
 
 std::vector<std::shared_ptr<Listener>> Engine::listeners_copy() {
@@ -130,11 +129,9 @@ void Engine::set_mic(bool on) {
   if (on) {
     if (!mic_) {
       mic_reader_.reset();
-      mic_ = std::make_unique<MicCapture>([this](const float *x, int n) { mic_reader_.write(x, n); });
-      mic_->start();
+      mic_ = audio_->open_mic("", [this](const float *x, int n) { mic_reader_.write(x, n); });
     }
   } else if (mic_) {
-    mic_->stop();
     mic_.reset();
     mic_active_ = false;
     mic_level_db_ = -90.f;
@@ -145,10 +142,8 @@ void Engine::set_mic(bool on) {
 void Engine::set_talkback(bool on) {
   settings_.talkback = on;
   talk_allowed_ = on;
-  if (render_) {
-    if (on && !render_->running()) render_->start();
-    if (!on) render_->stop();
-  }
+  if (on && !render_) render_ = audio_->open_render("", [this](float *x, int n) { render_pull(x, n); });
+  if (!on) render_.reset();
   for (auto &l : listeners_copy()) l->notify_settings();
 }
 
@@ -353,11 +348,14 @@ Snapshot Engine::snapshot() {
   s.turn = turn_;
   if (capture_) { s.source = capture_->source(); s.process_loopback = capture_->process_loopback(); }
   s.mic = settings_.mic;
-  s.mic_name = mic_ ? mic_->name() : "";
+  if (mic_) {
+    StreamStatus ms = mic_->status();
+    s.mic_name = ms.running ? ms.device_name : "no microphone";
+  }
   s.mic_active = mic_active_;
   s.mic_level_db = mic_level_db_;
   s.talkback = settings_.talkback;
-  s.talk_device = render_ ? render_->name() : "";
+  s.talk_device = render_ ? render_->status().device_name : "";
   s.auto_level = settings_.auto_level;
   s.max_kbps = settings_.max_kbps;
   s.max_listeners = settings_.max_listeners;
