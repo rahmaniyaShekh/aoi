@@ -66,6 +66,16 @@ void edit_user_path(bool add) {
 }
 }  // namespace
 
+// Removes aoi.exe.old* left by earlier updates (they are locked only while the
+// process that was running from them is alive).
+void cleanup_old_copies() {
+  std::error_code ec;
+  for (auto &f : std::filesystem::directory_iterator(install_dir(), ec)) {
+    auto name = f.path().filename().wstring();
+    if (name.rfind(L"aoi.exe.old", 0) == 0) DeleteFileW(f.path().c_str());
+  }
+}
+
 std::filesystem::path install_dir() { return local_appdata() / L"Programs" / L"AOI"; }
 std::filesystem::path installed_exe() { return install_dir() / L"aoi.exe"; }
 
@@ -78,16 +88,33 @@ bool install(std::string *err) {
   std::error_code ec;
   std::filesystem::create_directories(install_dir(), ec);
   if (!is_installed_copy()) {
-    // A running copy locks its file, but it can still be renamed out of the way.
-    auto old = installed_exe();
-    old += L".old";
-    DeleteFileW(old.c_str());
-    if (std::filesystem::exists(installed_exe(), ec)) MoveFileExW(installed_exe().c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING);
-    if (!CopyFileW(exe_path().c_str(), installed_exe().c_str(), FALSE)) {
-      if (err) *err = "could not copy to " + narrow(install_dir().wstring()) + ": " + hr_text(long(HRESULT_FROM_WIN32(GetLastError())));
+    // A running copy (the host just stopped, or the `aoi update` that launched
+    // us) locks its file against overwriting, but it can be renamed out of the
+    // way. Each rename gets a unique name so a leftover, still-locked .old file
+    // can never block it, and both steps retry briefly: a process that has just
+    // exited, or an antivirus scan, can hold the file for a moment.
+    cleanup_old_copies();
+    std::filesystem::path old;
+    DWORD e = 0;
+    bool ok = false;
+    for (int attempt = 0; attempt < 25 && !ok; ++attempt) {
+      if (attempt) Sleep(200);
+      if (std::filesystem::exists(installed_exe(), ec)) {
+        old = installed_exe();
+        old += L".old-" + widen(random_hex(4));
+        if (!MoveFileExW(installed_exe().c_str(), old.c_str(), 0)) { e = GetLastError(); continue; }
+      }
+      ok = CopyFileW(exe_path().c_str(), installed_exe().c_str(), FALSE) != 0;
+      if (!ok) {
+        e = GetLastError();
+        if (!old.empty()) MoveFileExW(old.c_str(), installed_exe().c_str(), 0);  // put it back and retry
+      }
+    }
+    if (!ok) {
+      if (err) *err = "could not copy to " + narrow(install_dir().wstring()) + ": " + hr_text(long(HRESULT_FROM_WIN32(e)));
       return false;
     }
-    if (!DeleteFileW(old.c_str())) MoveFileExW(old.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+    if (!old.empty() && !DeleteFileW(old.c_str())) MoveFileExW(old.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
   }
   edit_user_path(true);
 

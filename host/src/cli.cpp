@@ -128,9 +128,8 @@ void print_status(const json &st) {
   outf("\n    %sListeners %d/%d%s\n", C_BOLD, live_n, st.value("max_listeners", 2), C_RST);
   double lf = st.value("last_failed_s", -1.0);
   if (lf >= 0 && lf < 600)
-    outf("    %s%d join attempt(s) could not connect (last %.0f s ago): the two networks cannot reach\n"
-         "    each other directly%s%s\n", C_WARN, st.value("failed_connects", 0), lf,
-         st.value("turn", false) ? ", even through the relay" : " and the server has no relay (TURN) yet", C_RST);
+    outf("    %s%d join attempt(s) could not connect directly (last %.0f s ago); their page switches to the relay%s\n",
+         C_DIM, st.value("failed_connects", 0), lf, C_RST);
   if (!n) outf("    %snobody yet - share the link%s\n", C_DIM, C_RST);
   for (auto &l : st["listeners"]) {
     std::string name = l.value("name", "");
@@ -203,6 +202,7 @@ int serve(const std::vector<std::wstring> &args, bool foreground) {
   LOGI("aoi %s starting (pid %lu)%s", AOI_VERSION, GetCurrentProcessId(), foreground ? " in foreground" : "");
   if (s.sim.active()) LOGW("network simulator active: %s", s.sim.describe().c_str());
   write_file_atomic(data_dir() / L"aoi.pid", std::to_string(GetCurrentProcessId()));
+  cleanup_old_copies();  // leftovers from an update, unlocked now
   CoInitializeEx(nullptr, COINIT_MULTITHREADED);
   g_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
   SetConsoleCtrlHandler(on_ctrl, TRUE);
@@ -433,30 +433,36 @@ int cmd_install(bool start_after) {
 
 // Fetches the latest release with the GitHub CLI (the repository is private)
 // and installs it over this one; a running host is restarted on the new build.
-int cmd_update() {
+int cmd_update(const std::wstring &from) {
   wchar_t tmp[MAX_PATH];
   GetTempPathW(MAX_PATH, tmp);
   std::filesystem::path dir = std::filesystem::path(tmp) / (L"aoi-update-" + widen(random_hex(4)));
   std::error_code ec;
   std::filesystem::create_directories(dir, ec);
-  outf("  Downloading the latest AOI release...\n");
-  std::wstring cmd = L"gh release download -R rahmaniyaShekh/aoi -p aoi.exe --clobber -D \"" + dir.wstring() + L"\"";
-  STARTUPINFOW si{sizeof si};
-  PROCESS_INFORMATION pi{};
-  DWORD code = 1;
-  if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi)) {
-    WaitForSingleObject(pi.hProcess, 300000);
-    GetExitCodeProcess(pi.hProcess, &code);
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-  } else {
-    outf("%s  The GitHub CLI is needed: winget install --id GitHub.cli, then gh auth login%s\n", C_BAD, C_RST);
-    return 1;
-  }
   auto exe = dir / L"aoi.exe";
-  if (code != 0 || !std::filesystem::exists(exe, ec)) {
-    outf("%s  Download failed (logged in with gh, with access to the repository?)%s\n", C_BAD, C_RST);
-    return 1;
+  STARTUPINFOW si{sizeof si};
+  DWORD code = 1;
+  if (!from.empty()) {
+    // `aoi update --from <file>`: install a local build exactly the way a
+    // downloaded release is installed (offline machines, and testing).
+    if (!CopyFileW(from.c_str(), exe.c_str(), FALSE)) { outf("%s  Cannot read that file%s\n", C_BAD, C_RST); return 1; }
+  } else {
+    outf("  Downloading the latest AOI release...\n");
+    std::wstring cmd = L"gh release download -R rahmaniyaShekh/aoi -p aoi.exe --clobber -D \"" + dir.wstring() + L"\"";
+    PROCESS_INFORMATION pi{};
+    if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi)) {
+      WaitForSingleObject(pi.hProcess, 300000);
+      GetExitCodeProcess(pi.hProcess, &code);
+      CloseHandle(pi.hThread);
+      CloseHandle(pi.hProcess);
+    } else {
+      outf("%s  The GitHub CLI is needed: winget install --id GitHub.cli, then gh auth login%s\n", C_BAD, C_RST);
+      return 1;
+    }
+    if (code != 0 || !std::filesystem::exists(exe, ec)) {
+      outf("%s  Download failed (logged in with gh, with access to the repository?)%s\n", C_BAD, C_RST);
+      return 1;
+    }
   }
   // The new exe installs itself (stopping this one if it runs) and starts.
   std::wstring inst = L"\"" + exe.wstring() + L"\" install";

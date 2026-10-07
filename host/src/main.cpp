@@ -42,7 +42,11 @@ int wmain(int argc, wchar_t **argv) {
   if (cmd == L"kick") return cmd_kick(atoi(arg(0).c_str()));
   if (cmd == L"install") return cmd_install(!flag(L"--no-start"));
   if (cmd == L"uninstall") return cmd_uninstall(flag(L"--purge"));
-  if (cmd == L"update" || cmd == L"upgrade") return cmd_update();
+  if (cmd == L"update" || cmd == L"upgrade") {
+    std::wstring from;
+    for (size_t i = 0; i + 1 < rest.size(); ++i) if (rest[i] == L"--from") from = rest[i + 1];
+    return cmd_update(from);
+  }
   if (cmd == L"selftest") return run_selftest(rest);
   if (cmd == L"version" || cmd == L"--version") { outf("aoi %s\n", AOI_VERSION); return 0; }
   if (cmd == L"help" || cmd == L"-h" || cmd == L"--help") return cmd_help();

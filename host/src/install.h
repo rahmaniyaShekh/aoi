@@ -14,6 +14,7 @@ std::filesystem::path install_dir();
 std::filesystem::path installed_exe();
 bool is_installed_copy();                  // running from the install location
 bool install(std::string *err);
+void cleanup_old_copies();
 bool uninstall(bool remove_data, std::string *err);
 bool autostart_enabled();
 void set_autostart(bool on);

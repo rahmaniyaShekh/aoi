@@ -185,12 +185,13 @@ void Engine::housekeeping() {
             LOGI("listener %d gone", (*it)->id());
           } else {
             // Signalling worked but no network path formed: both sides are
-            // behind NATs that will not talk directly. Only a relay helps.
+            // behind NATs that will not talk directly. Their page now
+            // retries through the relay on its own.
             ++failed_connects_;
             last_failed_us_ = now;
             refresh_ice_ = true;
-            LOGW("listener %d could not connect: no direct network path%s", (*it)->id(),
-                 turn_ ? " even with the relay offered" : "; no relay (TURN) is configured on the server");
+            LOGI("listener %d could not connect directly (no network path); their page falls back to the relay",
+                 (*it)->id());
           }
           to_shut.push_back(*it);
           graveyard_.push_back({now, *it});
