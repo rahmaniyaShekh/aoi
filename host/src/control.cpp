@@ -37,7 +37,8 @@ json snapshot_json(const Snapshot &s) {
           {"mic_active", s.mic_active}, {"mic_level_db", s.mic_level_db}, {"talkback", s.talkback},
           {"talk_device", s.talk_device}, {"auto_level", s.auto_level}, {"max_kbps", s.max_kbps},
           {"gain_db", s.gain_db}, {"source_lufs", s.source_lufs}, {"peak", {s.peak[0], s.peak[1]}},
-          {"listeners", ls}, {"max_listeners", s.max_listeners}, {"pid", GetCurrentProcessId()},
+          {"listeners", ls}, {"max_listeners", s.max_listeners},
+          {"failed_connects", s.failed_connects}, {"last_failed_s", s.last_failed_s}, {"pid", GetCurrentProcessId()},
           {"version", AOI_VERSION}};
 }
 

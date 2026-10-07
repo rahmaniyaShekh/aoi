@@ -24,6 +24,7 @@ int cmd_new_code();
 int cmd_kick(int id);
 int cmd_install(bool start_after);
 int cmd_uninstall(bool purge);
+int cmd_update();
 int cmd_help();
 int run_selftest(const std::vector<std::wstring> &args);
 

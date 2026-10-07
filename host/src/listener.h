@@ -95,6 +95,7 @@ class Listener : public std::enable_shared_from_this<Listener> {
   bool dead() const;
   int id() const { return id_; }
   double age_s() const { return (now_us() - created_us_) / 1e6; }
+  bool was_live() const { return live_since_ != 0; }
   ListenerView view() const;
   void notify_settings();  // host toggled mic/talkback: tell the page
 

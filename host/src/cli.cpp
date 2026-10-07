@@ -123,7 +123,14 @@ void print_status(const json &st) {
   outf("    %-10s %s\n", "Talkback", st.value("talkback", false) ? ("on → " + st.value("talk_device", "")).c_str() : "off");
   outf("    %-10s up to %d kbps, adapts per listener%s\n", "Quality", st.value("max_kbps", 256),
        st.value("turn", false) ? " · relay available" : "");
-  outf("\n    %sListeners %d/%d%s\n", C_BOLD, n, st.value("max_listeners", 2), C_RST);
+  int live_n = 0;
+  for (auto &l : st["listeners"]) live_n += l.value("state", "") == "live";
+  outf("\n    %sListeners %d/%d%s\n", C_BOLD, live_n, st.value("max_listeners", 2), C_RST);
+  double lf = st.value("last_failed_s", -1.0);
+  if (lf >= 0 && lf < 600)
+    outf("    %s%d join attempt(s) could not connect (last %.0f s ago): the two networks cannot reach\n"
+         "    each other directly%s%s\n", C_WARN, st.value("failed_connects", 0), lf,
+         st.value("turn", false) ? ", even through the relay" : " and the server has no relay (TURN) yet", C_RST);
   if (!n) outf("    %snobody yet - share the link%s\n", C_DIM, C_RST);
   for (auto &l : st["listeners"]) {
     std::string name = l.value("name", "");
@@ -424,6 +431,45 @@ int cmd_install(bool start_after) {
   return 0;
 }
 
+// Fetches the latest release with the GitHub CLI (the repository is private)
+// and installs it over this one; a running host is restarted on the new build.
+int cmd_update() {
+  wchar_t tmp[MAX_PATH];
+  GetTempPathW(MAX_PATH, tmp);
+  std::filesystem::path dir = std::filesystem::path(tmp) / (L"aoi-update-" + widen(random_hex(4)));
+  std::error_code ec;
+  std::filesystem::create_directories(dir, ec);
+  outf("  Downloading the latest AOI release...\n");
+  std::wstring cmd = L"gh release download -R rahmaniyaShekh/aoi -p aoi.exe --clobber -D \"" + dir.wstring() + L"\"";
+  STARTUPINFOW si{sizeof si};
+  PROCESS_INFORMATION pi{};
+  DWORD code = 1;
+  if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi)) {
+    WaitForSingleObject(pi.hProcess, 300000);
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+  } else {
+    outf("%s  The GitHub CLI is needed: winget install --id GitHub.cli, then gh auth login%s\n", C_BAD, C_RST);
+    return 1;
+  }
+  auto exe = dir / L"aoi.exe";
+  if (code != 0 || !std::filesystem::exists(exe, ec)) {
+    outf("%s  Download failed (logged in with gh, with access to the repository?)%s\n", C_BAD, C_RST);
+    return 1;
+  }
+  // The new exe installs itself (stopping this one if it runs) and starts.
+  std::wstring inst = L"\"" + exe.wstring() + L"\" install";
+  PROCESS_INFORMATION p2{};
+  if (!CreateProcessW(nullptr, inst.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &p2)) return 1;
+  WaitForSingleObject(p2.hProcess, 120000);
+  GetExitCodeProcess(p2.hProcess, &code);
+  CloseHandle(p2.hThread);
+  CloseHandle(p2.hProcess);
+  std::filesystem::remove_all(dir, ec);
+  return int(code);
+}
+
 int cmd_uninstall(bool purge) {
   cmd_stop();
   std::string err;
@@ -443,6 +489,7 @@ int cmd_help() {
       "    aoi new-code          new code; disconnects everyone on the old one\n"
       "    aoi kick <n>          remove listener #n\n"
       "\n"
+      "    aoi update            install the latest release (uses the GitHub CLI)\n"
       "    aoi install           install for this user (PATH + Apps & features, no admin)\n"
       "    aoi uninstall [--purge]\n"
       "    aoi run               run in this terminal instead of the background\n"

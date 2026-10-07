@@ -281,12 +281,14 @@ const savePrefs = () => saveJSON(PREFS, prefs);
 // ============================================================================
 // Screens
 // ============================================================================
-function status(text) { $('status').textContent = text || ''; }
+let netHint = '';   // sticky explanation shown under every status while it applies
+function status(text) { $('status').textContent = text ? (netHint ? `${text} ${netHint}` : text) : ''; }
 function joining(on) {
   $('goBtn').hidden = on; $('cancelBtn').hidden = !on; $('code').disabled = on;
 }
 function showJoin(msg) {
   stopAll();
+  netHint = '';
   $('listen').hidden = true; $('join').hidden = false;
   joining(false); status(''); $('error').textContent = msg || '';
   renderSaved();
@@ -336,7 +338,7 @@ async function iceServers() {
   if (iceCache && Date.now() - iceCache.at < 3600e3) return iceCache.servers;
   try {
     const r = await fetch(`${BASE}/api/turn`, { cache: 'no-store' });
-    if (r.ok) { const j = await r.json(); iceCache = { at: Date.now(), servers: j.iceServers }; return j.iceServers; }
+    if (r.ok) { const j = await r.json(); iceCache = { at: Date.now(), servers: j.iceServers, turn: !!j.turn }; return j.iceServers; }
   } catch { }
   return [{ urls: ['stun:stun.cloudflare.com:3478', 'stun:stun.l.google.com:19302'] }];
 }
@@ -388,7 +390,7 @@ function start(code) {
 // a superseded attempt can never touch the connection that replaced it.
 async function driver(code, known, gen) {
   const id = await roomIdFor(code);
-  let everConnected = false, waitingSince = Date.now();
+  let everConnected = false, waitingSince = Date.now(), failedInARow = 0;
   while (gen === generation) {
     let room;
     try { room = await getOffer(id); }
@@ -409,6 +411,13 @@ async function driver(code, known, gen) {
     if (outcome === 'kicked') return showJoin('The host removed you.');
     if (outcome === 'newcode') { saveJSON(STORE, loadSaved().filter(e => e.code !== code)); return showJoin('The host changed their code. Ask them for the new one.'); }
     $('listen').hidden = true; $('join').hidden = false; joining(true);
+    // The host answered but no audio path formed: say so instead of an
+    // endless "Connecting…", and keep trying (networks change, relays appear).
+    failedInARow = (outcome === 'timeout' || outcome === 'failed') ? failedInARow + 1 : 0;
+    netHint = failedInARow >= 2
+      ? `(Your network can't reach ${S.name || room.name || 'the host'} directly` +
+        (iceCache?.turn ? ', even through the relay.)' : '; a relay is needed between these two networks.)')
+      : '';
     status(everConnected ? 'Reconnecting…' : 'Finding the host…');
     if (outcome !== 'stale') await sleep(600);
     waitingSince = Date.now();
@@ -509,6 +518,7 @@ async function attempt(id, code, room, gen, onLive) {
     if (why !== 'connected') { pc.close(); return why === 'bye' ? byeKind(byeReason) : why; }
 
     onLive();
+    netHint = '';
     S.live = true;
     rememberHost(code, S.name);
     enterListening();

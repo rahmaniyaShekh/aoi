@@ -34,7 +34,8 @@ struct Snapshot {
   std::string code, pretty, link, status, source, mic_name, talk_device, error;
   bool published = false, socket = false, turn = false, process_loopback = false;
   bool mic = false, talkback = false, auto_level = false, mic_active = false;
-  int max_kbps = 256, max_listeners = 2;
+  int max_kbps = 256, max_listeners = 2, failed_connects = 0;
+  double last_failed_s = -1;
   float peak[2]{}, rms[2]{}, mic_level_db = -90, gain_db = 0, source_lufs = -70, limiter_db = 0;
   std::vector<ListenerView> listeners;
 };
@@ -77,7 +78,9 @@ class Engine {
 
   // shared with listeners (they hold pointers)
   std::atomic<bool> talk_allowed_{true}, mic_on_{false};
-  std::atomic<int> max_kbps_{256}, listener_count_{0};
+  std::atomic<int> max_kbps_{256}, listener_count_{0}, connecting_count_{0}, failed_connects_{0};
+  std::atomic<int64_t> last_failed_us_{0};
+  std::atomic<bool> refresh_ice_{false};
 
   std::mutex mu_;
   std::vector<std::shared_ptr<Listener>> listeners_;
