@@ -10,6 +10,7 @@ namespace aoi {
 namespace {
 constexpr int kRing = 8192;
 constexpr int kMinBps = 12000;
+constexpr double kQueueEvidenceMs = 8.0;  // a standing queue, not jitter
 constexpr int64_t kGroupUs = 5000;     // packets sent within 5 ms form one group
 constexpr size_t kTrendWindow = 20;
 constexpr double kTrendGain = 4.0;
@@ -211,7 +212,14 @@ void CongestionController::rate_update(int64_t now) {
   double rtt = rtt_.init ? rtt_.v : 100.0;
 
   // ---- delay-based AIMD ----
-  if (use_ == Use::Over) {
+  // The trendline also fires on jitter alone (Wi-Fi, mobile): delays that
+  // swing but do not stay up. Cut only when a queue really stands -- the
+  // minimum one-way delay over the last second above the 10 s minimum -- or
+  // packets are being lost; otherwise hold. Measured on a real listener: every
+  // false cut went to 0.85x the (already low, application-limited) send rate,
+  // spiralling a clean 60 ms link down to 12-30 kbps.
+  bool queue = !have_twcc_ || queue_ms_ > kQueueEvidenceMs || loss_.v > 0.05;
+  if (use_ == Use::Over && queue) {
     if (now - last_decrease_us_ > int64_t(std::max(rtt, 100.0) * 1000)) {
       double measured = acked_bps_ > 0 ? acked_bps_ : target_;
       double next = std::min(target_, 0.85 * measured);

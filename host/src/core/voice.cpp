@@ -58,8 +58,10 @@ struct VoiceProcessor::Impl {
   VoiceOptions opt;
 #if AOI_HAVE_APM
   rtc::scoped_refptr<webrtc::AudioProcessing> apm;
+  webrtc::AudioProcessing::Config config;
   std::unique_ptr<webrtc::VoiceActivityDetectorWrapper> vad;
 #endif
+  std::mutex cfg_mu;  // set_echo_cancel() callers
   VoiceChain fallback;  // only when APM is not compiled in
   std::vector<float> s16;
   // capture-thread state
@@ -130,6 +132,7 @@ VoiceProcessor::VoiceProcessor(VoiceOptions o) : impl_(std::make_unique<Impl>())
   builder.SetConfig(c);
   if (o.aec) builder.SetEchoControlFactory(std::make_unique<Aec3Factory>());
   m.apm = builder.Create();
+  m.config = c;
   m.vad = std::make_unique<webrtc::VoiceActivityDetectorWrapper>(webrtc::GetAvailableCpuFeatures(), 48000);
   m.st.apm = m.apm != nullptr;
 #endif
@@ -144,13 +147,26 @@ VoiceProcessor::VoiceProcessor(VoiceOptions o) : impl_(std::make_unique<Impl>())
 
 VoiceProcessor::~VoiceProcessor() = default;
 
+void VoiceProcessor::set_echo_cancel(bool on) {
+  Impl &m = *impl_;
+  std::lock_guard lk(m.cfg_mu);
+  if (!m.opt.aec || echo_on_ == on) return;
+#if AOI_HAVE_APM
+  if (m.apm) {
+    m.config.echo_canceller.enabled = on;
+    m.apm->ApplyConfig(m.config);
+  }
+#endif
+  echo_on_ = on;
+}
+
 void VoiceProcessor::reverse(const float *x) {
   Impl &m = *impl_;
   int64_t t0 = now_us();
   m.record(0, x);
   if (block_rms(x, kFrames) > 0.001f) m.ref_active_until = t0 + 500000;  // above -60 dBFS
 #if AOI_HAVE_APM
-  if (m.apm && m.opt.aec) {
+  if (m.apm && m.opt.aec && echo_on_) {
     webrtc::StreamConfig sc(48000, 1);
     std::vector<float> tmp(x, x + kFrames);
     const float *src[1] = {tmp.data()};
@@ -174,7 +190,7 @@ void VoiceProcessor::process(float *x) {
     webrtc::StreamConfig sc(48000, 1);
     const float *src[1] = {x};
     float *dst[1] = {x};
-    if (m.opt.aec) m.apm->set_stream_delay_ms(delay_ms_);
+    if (m.opt.aec && echo_on_) m.apm->set_stream_delay_ms(delay_ms_);
     m.apm->ProcessStream(src, sc, sc, dst);
     float pg = m.opt.agc ? db_to_gain(kPostGainDb) : 1.f;
     for (int i = 0; i < kFrames; ++i) { x[i] *= pg; m.s16[i] = x[i] * 32768.f; }
@@ -253,7 +269,9 @@ void VoiceProcessor::process(float *x) {
   s.cpu_avg_us = float(m.cpu_sum / double(m.cpu_n));
   s.cpu_max_us = m.cpu_max;
 #if AOI_HAVE_APM
-  if (m.apm && m.opt.aec && s.blocks % 50 == 0) {
+  s.aec = m.st.apm && m.opt.aec && echo_on_;
+  if (!s.aec) { s.erle_db.reset(); s.erl_db.reset(); s.delay_ms.reset(); s.residual_echo.reset(); s.echo = false; }
+  if (m.apm && s.aec && s.blocks % 50 == 0) {
     auto a = m.apm->GetStatistics();
     s.erle_db = a.echo_return_loss_enhancement;
     s.erl_db = a.echo_return_loss;

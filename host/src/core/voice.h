@@ -26,7 +26,10 @@
 namespace aoi {
 
 struct VoiceOptions {
-  bool aec = true, ns = true, agc = true, expander = true;
+  // aec: the canceller may be used (set_echo_cancel turns it on and off).
+  // expander: an extra dip while the reference plays and nobody here talks;
+  // off, because a missed syllable then takes the owner's voice down too.
+  bool aec = true, ns = true, agc = true, expander = false;
   float initial_gain_db = 22.f;  // where AGC2 starts (the last converged value for a known mic)
 };
 
@@ -66,6 +69,11 @@ class VoiceProcessor {
   void reverse(const float *block);  // echo reference, any thread
   void process(float *block);        // microphone, in place, one thread
   void set_delay_ms(int ms) { delay_ms_ = ms; }
+  // Cancel echo only while sound plays somewhere the mic can hear it
+  // (speakers). With earphones, earbuds or a headset there is no echo, and a
+  // canceller could only take the owner's voice away. Any thread.
+  void set_echo_cancel(bool on);
+  bool echo_cancel() const { return echo_on_; }
   bool voice_active() const { return voice_; }
   VoiceStats stats() const;
   static bool apm_available();
@@ -75,6 +83,7 @@ class VoiceProcessor {
   std::unique_ptr<Impl> impl_;
   std::atomic<int> delay_ms_{60};
   std::atomic<bool> voice_{false};
+  std::atomic<bool> echo_on_{true};
 };
 
 }  // namespace aoi

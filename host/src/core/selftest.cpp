@@ -247,7 +247,7 @@ void test_talkback() {
 struct SimResult { double wire_kbps, max_queue_ms, opus_kbps, red, loss; int frame; bool stereo; double last_congested_s; };
 
 SimResult run_cc(std::function<double(double)> capacity_kbps, double loss, double seconds, double prop_ms = 40,
-                 bool redcap = true) {
+                 bool redcap = true, double jitter_ms = 0) {
   CongestionController cc;
   PeerCaps caps{redcap, true, true, 256000};
   std::mt19937 rng(11);
@@ -258,6 +258,7 @@ SimResult run_cc(std::function<double(double)> capacity_kbps, double loss, doubl
   std::vector<Pending> inflight;
   uint16_t tseq = 0;
   double next_fb = 0.1, next_rtt = 0.5, max_queue = 0, window_bytes = 0, window_start = seconds - 10, last_cong = 0;
+  double spike = 0;
   Plan plan;
   for (double t = 0; t < seconds;) {
     int64_t now = t0 + int64_t(t * 1e6);
@@ -271,7 +272,12 @@ SimResult run_cc(std::function<double(double)> capacity_kbps, double loss, doubl
     if (!dropped) link_free = std::max(t, link_free) + tx;
     max_queue = std::max(max_queue, t > 5 ? queue * 1000 : 0.0);
     if (queue > 0.1) last_cong = t;
-    int64_t arrive = t0 + int64_t((link_free + prop_ms / 2000.0) * 1e6);
+    // Wi-Fi / mobile radio: delay spikes that come and go (retries, power
+    // save, scheduling), with no queue behind them.
+    if (jitter_ms > 0 && u(rng) < 0.04) spike = jitter_ms * (0.5 + 0.5 * u(rng));
+    spike = std::max(0.0, spike - plan.frame_ms * 0.4);
+    double extra = jitter_ms > 0 ? (spike + u(rng) * 8.0) / 1000.0 : 0.0;
+    int64_t arrive = t0 + int64_t((link_free + prop_ms / 2000.0 + extra) * 1e6);
     cc.on_sent(tseq, now, bytes);
     inflight.push_back({arrive, tseq, lost});
     ++tseq;
@@ -320,6 +326,9 @@ void test_cc() {
   check(d.wire_kbps <= 48 * 1.05 && recover < 3.0, "capacity drops 600 -> 48 kbps: follows it down",
         f1("queue drained %.1f s after the drop, then wire %.1f kbps, opus %.0f kbps, %.0f ms frames", recover, d.wire_kbps,
            d.opus_kbps, d.frame));
+  auto j = run_cc([](double) { return 2000.0; }, 0.005, 40, 60, true, 80);
+  check(j.opus_kbps >= 200, "jittery Wi-Fi/mobile, no queue: keeps quality",
+        f1("delay spikes up to 80 ms: opus %.0f kbps, wire %.0f kbps", j.opus_kbps, j.wire_kbps));
   auto e = run_cc([](double) { return 24.0; }, 0.02, 60);
   check(e.wire_kbps <= 24 * 1.05 && e.wire_kbps >= 24 * 0.75 && e.frame >= 40, "24 kbps link (2G-class): long frames, fits, uses it",
         f1("wire %.1f kbps, opus %.0f kbps, %.0f ms frames", e.wire_kbps, e.opus_kbps, e.frame));

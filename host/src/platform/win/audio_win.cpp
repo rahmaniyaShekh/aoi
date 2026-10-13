@@ -327,6 +327,11 @@ bool raw_supported(IMMDevice *dev) {
 // cannot follow; our own voice chain does the same jobs after it. Must be
 // set before Initialize. False (default mode) when the device has no raw path.
 bool request_raw(IAudioClient *client, IMMDevice *dev) {
+  // Only for mics that hear the room's speakers. A headset mic is next to
+  // the mouth, and a Bluetooth one's raw signal skips the gain its driver
+  // applies (measured: speech at -59 dBFS from CMF Buds in raw mode).
+  DeviceInfo d = describe(dev, DeviceKind::Capture);
+  if (d.bus == DeviceBus::Bluetooth || d.form == FormFactor::Headset || d.form == FormFactor::Handset) return false;
   if (!raw_supported(dev)) return false;
   Com<IAudioClient2> c2;
   if (FAILED(client->QueryInterface(__uuidof(IAudioClient2), reinterpret_cast<void **>(&c2)))) return false;

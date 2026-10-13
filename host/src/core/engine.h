@@ -147,6 +147,7 @@ class Engine {
   std::string ref_name_, ref2_name_;
   DriftReader ref2_reader_{kRate};
   std::atomic<bool> ref2_on_{false};
+  std::atomic<bool> room_echo_{true};  // sound plays on speakers the mic can hear
   std::vector<float> ref_acc_;  // reference thread only
 
   // shared with listeners (they hold pointers)

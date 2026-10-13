@@ -584,6 +584,11 @@ void Engine::reevaluate() {
   std::optional<DeviceInfo> sec;
   for (auto &r : rens)
     if (r.default_console && (!sc.device || r.id != sc.device->id) && audible_in_room(r)) sec = r;
+  // Echo exists only when something plays out loud in the room. Earphones,
+  // earbuds and headsets: no canceller (it could only eat the owner's voice).
+  bool room = (sc.device && audible_in_room(*sc.device)) || sec.has_value();
+  if (room != room_echo_.exchange(room))
+    LOGI("echo cancellation %s", room ? "on (sound plays on speakers)" : "off (earphones or headset: no echo)");
   bool mic_changed, spk_changed;
   {
     std::lock_guard lk(dev_mu_);
@@ -606,6 +611,10 @@ void Engine::reevaluate() {
   if (spk_changed && sc.device)
     LOGI("talkback output: %s (%s; %s)", sc.device->name.c_str(), device_type(*sc.device).c_str(), sc.reason.c_str());
 
+  {
+    std::lock_guard lk(mic_mu_);
+    for (auto *ch : {&cur_, &next_}) if (*ch) (*ch)->vp->set_echo_cancel(room);
+  }
   if (mic_on_ && mc.device) {
     std::string have;
     {
@@ -629,7 +638,12 @@ void Engine::open_mic(const DeviceInfo &d) {
     o.initial_gain_db = it != prefs_.agc_gain_db.end() ? it->second : default_initial_gain(d);
     ch->saved_gain = it != prefs_.agc_gain_db.end() ? it->second : -100.f;
   }
+  // A headset's mic sits at the mouth with the speakers sealed in the ears:
+  // there is no echo worth cancelling, and an echo canceller (or the dip it
+  // makes while music plays) can only take the owner's voice away.
+  if (d.form == FormFactor::Headset || d.form == FormFactor::Handset) o.aec = o.expander = false;
   ch->vp = std::make_shared<VoiceProcessor>(o);
+  ch->vp->set_echo_cancel(room_echo_);
   ch->reader.set_target(kRate * 20 / 1000);  // 20 ms absorbs the mic's 10 ms event-driven delivery
   ch->opened_us = now_us();
   if (settings_.mic_tap) ch->tap = &settings_.mic_tap;
@@ -683,7 +697,7 @@ void Engine::open_output(const std::optional<DeviceInfo> &spk, const std::option
   }
   // The echo reference follows the talkback device whether or not talkback
   // is on: the music the owner hears comes out of it too.
-  bool need_ref = run && mic_on_ && spk;
+  bool need_ref = run && mic_on_ && spk && room_echo_;
   if (!need_ref || want != ref_id_) { ref_loop_.reset(); ref_id_.clear(); ref_name_.clear(); }
   if (need_ref && !ref_loop_) {
     ref_acc_.clear();  // its thread is gone; the next one starts clean

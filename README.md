@@ -37,8 +37,8 @@ Listeners go to **https://share.mdarif.online/aoi** and type the code, or open
 | `aoi echotest` | Plays a voice and music through this PC's speakers for 35 s and reports how much echo the mic would send to listeners. Stop AOI first. |
 
 There are no settings. Defaults are fixed for the best result: system audio
-plus microphone (if there is one) with echo cancellation, talkback on, auto
-level on, adaptive Opus up to 256 kbps stereo, full loss protection, at most 2
+plus microphone (if there is one), echo cancellation whenever sound plays on
+speakers, talkback on, auto level on, adaptive Opus up to 256 kbps stereo, full loss protection, at most 2
 listeners. Each listener sets their own balance on their page.
 
 ## No echo: the host's voice chain
@@ -49,10 +49,17 @@ a moment later and the music twice. AOI removes it on the host, per 10 ms,
 with WebRTC's audio processing (the same AEC3 echo canceller, noise
 suppression and gain control Chrome uses):
 
-- **The microphone is opened raw** when the device allows it (most do): no
-  driver AGC, noise gate or add-on suite (Nahimic, Waves, DTS...). Those change
-  their gain all the time, which no echo canceller can follow; AOI does the
-  same jobs itself after the canceller.
+- **Only when there is echo.** The canceller runs while sound plays on
+  speakers the mic can hear. With earphones, earbuds or a headset there is
+  no echo, so it switches itself off (and back on if the sound moves to the
+  speakers): a canceller with nothing to cancel can only take the owner's
+  voice away. `aoi status` shows which.
+- **A laptop or desk microphone is opened raw** when the device allows it
+  (most do): no driver AGC, noise gate or add-on suite (Nahimic, Waves,
+  DTS...). Those change their gain all the time, which no echo canceller can
+  follow; AOI does the same jobs itself. Headset and Bluetooth mics stay in
+  Windows' normal mode (raw skips their gain: a Bluetooth headset's raw
+  speech measured -59 dBFS).
 - **The echo reference is what the speakers actually play**: the output
   device's loopback, after every app, our talkback and the device's own
   effects are mixed. One signal, one delay to the mic.
@@ -104,6 +111,7 @@ concealed dropped packets. Over the internet each of those becomes a weakness.
 | Congestion signal | Own send-queue backlog (right for TCP on a LAN) | Per-packet arrival times (transport-wide feedback) → trendline delay detector, plus a jitter-proof queue estimate (1 s vs 10 s minimum one-way delay), plus loss |
 | Shape of the stream | Discrete rungs | Continuous: bitrate, 20/40/60 ms frames (header overhead matters at 24 kbps), stereo→mono in the same encoder (seamless), redundancy depth with hysteresis |
 | Random loss vs congestion | Treated alike | Loss with no queue building (Wi-Fi, mobile) is answered with protection, not a rate cut; loss is judged on original packets only, since retransmissions die in the same burst |
+| Jitter vs congestion | n/a | Delay spikes that come and go (Wi-Fi retries, mobile scheduling) are not a queue: the rate is cut only when the minimum delay itself stays up, or packets are lost. (1.0.4 and earlier cut on jitter alone and could sink a fast but jittery link to ~12-50 kbps.) |
 | Listener buffer | Adaptive ring | Browser NetEq with an adaptive target: grows the moment audio is concealed, shrinks after clean stretches, and always leaves room (1.5×RTT) for a retransmission to arrive in time |
 | Limiter | 0.97 ceiling, one-block look-ahead | True sliding-window look-ahead limiter, −1 dBFS ceiling: a lossy decoder can overshoot its input |
 | Level | RMS makeup gain | ITU-R BS.1770 K-weighted loudness, gated, 70th percentile, bounded slew |

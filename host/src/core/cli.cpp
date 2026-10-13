@@ -134,7 +134,7 @@ void print_mic_lines(const json &st, bool detail) {
     return;
   }
   std::string echo;
-  if (!v.value("aec", false)) echo = "echo cancel off";
+  if (!v.value("aec", false)) echo = "echo cancel off (earphones or headset: no echo)";
   else if (!v.value("reference_active", false)) echo = "echo cancel ready (nothing playing)";
   else if (v.contains("measured_erle_db") && v["measured_erle_db"].is_number())
     echo = "echo cancel on: speaker sound " + fmt_opt(v["measured_erle_db"], "-%.0f dB") + " (" +
@@ -663,8 +663,9 @@ int cmd_help() {
       "    aoi echotest          play a voice and music for 35 s; measure the echo listeners would hear\n"
       "\n"
       "    Testing a bad network:  aoi start --simulate rate=48,loss=5,burst=3,delay=150,jitter=40\n\n"
-      "    Always on, nothing to configure: system audio + your microphone (if any) with\n"
-      "    echo cancellation, talkback, auto level, adaptive Opus up to 256 kbps stereo.\n"
+      "    Always on, nothing to configure: system audio + your microphone (if any),\n"
+      "    talkback, auto level, adaptive Opus up to 256 kbps stereo. Echo is cancelled\n"
+      "    only while sound plays on speakers; never with earphones, earbuds or a headset.\n"
       "    Each listener sets their own music/voice balance on their page.\n"
       "    Listeners open the link in a browser - no app, no account. Up to 2 at a time.\n\n");
   return 0;
