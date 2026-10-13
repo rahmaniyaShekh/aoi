@@ -870,6 +870,12 @@ void Listener::on_control(const std::string &text) {
       name_ = nm;
     }
     if (first) LOGI("listener %d: %s%s%s", id_, nm.c_str(), ua.empty() ? "" : " | ", ua.c_str());
+  } else if (t == "out") {
+    // Where the listener's page plays the sound (diagnostics): a Bluetooth
+    // call-mode output is mono, so left/right cannot reach their ears apart.
+    LOGI("listener %d: plays through \"%s\"%s%s", id_, m.value("label", std::string("?")).c_str(),
+         m.value("switched", false) ? " (switched there from a mono Bluetooth call output)" : "",
+         m.value("mono", false) ? " -- a mono Bluetooth call output: left/right separation impossible" : "");
   } else if (t == "talk") {
     // The listener's mic, as their browser opened it (diagnostics).
     LOGI("listener %d: mic %s%s", id_, m.value("on", false) ? "on" : "off",
@@ -921,7 +927,7 @@ void Listener::log_summary() {
        v.rx_buffer_ms, v.rx_conceal * 100,
        relay_ ? (" | queue " + std::to_string(relay_backlog_ms_.load()) + "ms, dropped " +
                  std::to_string(relay_dropped_ms_.load()) + "ms").c_str() : "",
-       v.talking ? "talking" : "quiet", v.talking ? (" " + std::to_string(int(ts.level_db)) + " dB, buffer " +
+       v.talking ? "talking" : "quiet", v.talking ? (" peak " + std::to_string(int(talk_.take_peak_db())) + " dB, buffer " +
                                                     std::to_string(int(ts.depth_ms)) + "ms").c_str() : "");
 }
 

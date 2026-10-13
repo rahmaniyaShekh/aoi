@@ -45,6 +45,7 @@ class TalkStream {
 
   struct Stats { double jitter_ms, target_ms, depth_ms, level_db; uint64_t lost, concealed, fec; bool playing; };
   Stats stats() const;
+  float take_peak_db();  // loudest 10 ms since the last call (the talker's speech level, not their pauses)
 
  private:
   void decode_one(std::vector<float> &out);
@@ -76,7 +77,7 @@ class TalkStream {
   double target_ms_ = 60, underrun_boost_ms_ = 0, min_target_ms_ = 0;
   int64_t last_arrival_ = 0, last_decay_ = 0;
   uint64_t lost_ = 0, concealed_ = 0, fec_ = 0;
-  float level_db_ = -90;
+  float level_db_ = -90, peak_db_ = -90;
 
   // sender report bookkeeping for RR
   uint32_t lsr_ = 0;

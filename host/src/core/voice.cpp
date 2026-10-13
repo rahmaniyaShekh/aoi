@@ -124,7 +124,7 @@ VoiceProcessor::VoiceProcessor(VoiceOptions o) : impl_(std::make_unique<Impl>())
   // Measured (selftest): speech settles at about -18 dBFS after the post
   // gain; a -40 dBFS talker gets there in about 1.5 s.
   ad.headroom_db = 1.f;
-  ad.max_gain_db = 36.f;
+  ad.max_gain_db = o.max_gain_db;
   ad.initial_gain_db = std::clamp(o.initial_gain_db, 0.f, 30.f);
   ad.max_gain_change_db_per_second = 12.f;
   ad.max_output_noise_level_dbfs = -50.f;

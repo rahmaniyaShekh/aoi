@@ -115,8 +115,20 @@ same headset as the mic, otherwise on Windows' default output.
   - *Sound plays in* / *Voice plays in*: Left, Both or Right. The sound in
     both ears stays stereo; in one ear it is folded to mono there.
   - *Apart* (voice left, sound right, the default) and *Together* presets.
-- **I'm using earphones** (on by default). The listener's mic opens raw: no
-  echo cancellation, noise suppression or auto gain in the browser. Asking a
+  - *Test left / right*: piano only in the left ear, drums only in the
+    right, then both, through the same path as the audio. Measured at the
+    player's output, each instrument's other side is digital silence; if
+    both are heard in both ears, the listener's device mixes the channels.
+- The page checks where it plays. Windows lists a Bluetooth headset twice:
+  "Headphones (Name)" (stereo) and "Headset (Name Hands-Free)" (the call
+  profile, mono, which puts left and right in both ears). If the sound would
+  go to the call one, the page plays to the same earbuds' stereo output
+  instead, or says why left and right cannot be kept apart. The host's log
+  records each listener's output.
+- **I'm using earphones** (on by default). No echo cancellation in the
+  browser. On a phone no noise suppression or auto gain either (the mic opens
+  raw); on a computer those two stay on, since a raw laptop mic can arrive
+  40 dB too quiet and a computer's playback is not affected by them. Asking a
   phone for any of them puts it in "call mode", where its own voice
   processing cancels or ducks the music for as long as the mic is on. The
   host cleans the voice up instead (noise suppression and level, per

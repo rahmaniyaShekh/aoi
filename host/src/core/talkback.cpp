@@ -17,7 +17,8 @@ TalkStream::TalkStream(bool clean_voice) {
   o.aec = false;  // echo at the listener's end is their browser's job (it cancels when they use a speaker)
   o.gentle_ns = true;
   o.initial_gain_db = 6.f;
-  o.post_gain_db = 2.f;  // ~-14 dBFS speech: clear over the owner's music on the same output (the safety knee holds peaks)
+  o.post_gain_db = 2.f;
+  o.max_gain_db = 50.f;  // a listener's raw phone or laptop mic can arrive 40 dB down  // ~-14 dBFS speech: clear over the owner's music on the same output (the safety knee holds peaks)
   vp_ = std::make_unique<VoiceProcessor>(o);
 }
 
@@ -191,6 +192,7 @@ void TalkStream::mix_into(float *out, int n, float gain) {
     if (got < chunk) break;
   }
   level_db_ = 0.8f * level_db_ + 0.2f * gain_to_db(float(std::sqrt(ss / std::max(n, 1))));
+  peak_db_ = std::max(peak_db_, gain_to_db(float(std::sqrt(ss / std::max(n, 1)))));
   if (total < n) {
     // Ran dry: fall silent and re-buffer, a little deeper next time.
     playing_ = false;
@@ -245,6 +247,13 @@ TalkStream::Stats TalkStream::stats() const {
   double queued = pkts_.empty() ? 0.0 : double(pkts_.rbegin()->first + last_frame_ - next_ts_);
   return {jitter_ * 1000.0 / kRate, target_ms_, (std::max(0.0, queued) + ring_.avail()) * 1000.0 / kRate,
           level_db_, lost_, concealed_, fec_, playing_};
+}
+
+float TalkStream::take_peak_db() {
+  std::lock_guard lk(mu_);
+  float p = peak_db_;
+  peak_db_ = -90;
+  return p;
 }
 
 }  // namespace aoi
