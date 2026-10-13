@@ -31,6 +31,7 @@ struct VoiceOptions {
   // off, because a missed syllable then takes the owner's voice down too.
   bool aec = true, ns = true, agc = true, expander = false;
   bool gentle_ns = false;  // moderate noise suppression (a listener's voice, already compressed by Opus)
+  float post_gain_db = -2.f;  // after the gain stage (whose limiter peaks at full scale): speech settles near -18 dBFS
   float initial_gain_db = 22.f;  // where AGC2 starts (the last converged value for a known mic)
 };
 

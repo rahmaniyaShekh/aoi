@@ -37,6 +37,7 @@ struct Settings {
   // listener were talking back; `mic_tap` sees each 10 ms mic block before
   // and after voice processing (mic thread).
   bool offline = false;
+  bool split = false;  // `--split`: voice left, PC sound right; the listener mixes
   std::function<void(float *mono, int frames)> test_talk;
   std::function<void(const float *raw, const float *processed, int frames)> mic_tap;
   std::function<void(const float *ref, int frames)> ref_tap;  // the echo reference, as fed
@@ -63,6 +64,7 @@ struct Snapshot {
   std::vector<std::string> echo_reference;  // devices whose output is cancelled from the mic
   std::optional<float> mic_volume;          // the endpoint's own input level, 0..1
   bool mic_switching = false;
+  bool split = false;
   VoiceStats voice;
   std::vector<ListenerView> listeners;
 };

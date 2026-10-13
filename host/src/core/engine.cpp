@@ -27,6 +27,7 @@ struct Engine::MicChannel {
   int64_t opened_us = 0;
   float saved_gain = -100.f;
   int xfade = -1;  // capture thread only: crossfade position while this channel takes over
+  int underruns = 0;  // capture thread only: dry spells seen so far
   const std::function<void(const float *, const float *, int)> *tap = nullptr;
 
   void on_audio(const float *x, int n) {
@@ -183,6 +184,17 @@ void Engine::read_mic(float *out, bool *voice) {
   }
   bool ok = cur && cur->reader.read(out, kBlock);
   if (!cur) std::fill(out, out + kBlock, 0.f);
+  // The mic ran dry: its device delivers less evenly than we allowed for
+  // (Bluetooth mics do, in lumps). Every dry spell is a gap in the voice, a
+  // crackle to the listener; so hold 10 ms more each time, up to 150 ms.
+  if (cur && cur->reader.underruns() != cur->underruns) {
+    cur->underruns = cur->reader.underruns();
+    int t = cur->reader.target();
+    if (t < kRate * 150 / 1000) {
+      cur->reader.set_target(t + kRate / 100);
+      LOGD("microphone ran dry (%d times): buffer now %d ms", cur->underruns, (t + kRate / 100) * 1000 / kRate);
+    }
+  }
   bool v = cur && cur->vp->voice_active();
   if (nxt) {
     if (nxt->xfade < 0 && nxt->reader.fill() >= nxt->reader.target() + kBlock) nxt->xfade = 0;
@@ -407,6 +419,7 @@ void Engine::host_loop() {
     env.mic_active = &mic_active_;
     env.host_max_kbps = &max_kbps_;
     env.listener_count = &listener_count_;
+    env.split = settings_.split;
     int id;
     { std::lock_guard lk(mu_); id = next_id_++; }
     auto l = std::make_shared<Listener>(id, env);
@@ -644,7 +657,17 @@ void Engine::open_mic(const DeviceInfo &d) {
   if (d.form == FormFactor::Headset || d.form == FormFactor::Handset) o.aec = o.expander = false;
   ch->vp = std::make_shared<VoiceProcessor>(o);
   ch->vp->set_echo_cancel(room_echo_);
-  ch->reader.set_target(kRate * 20 / 1000);  // 20 ms absorbs the mic's 10 ms event-driven delivery
+  // A Windows input level far down (7% was seen) leaves the voice so faint
+  // that the auto level has to add 30+ dB to it, and with it the noise and
+  // every Bluetooth glitch: thin, hissy, crackly. Give the mic its full level;
+  // the auto level then only fine-tunes.
+  if (auto v = audio_->input_volume(d.id); v && *v < 0.5f) {
+    if (audio_->set_input_volume(d.id, 1.f))
+      LOGI("raised the Windows input level of %s from %.0f%% to 100%% (too low for a clear voice)", d.name.c_str(), *v * 100);
+  }
+  // 20 ms absorbs a wired mic's 10 ms event-driven delivery; Bluetooth
+  // delivers in lumps from the radio and starts at 50. Both grow on a dry spell.
+  ch->reader.set_target(kRate * (d.bus == DeviceBus::Bluetooth ? 50 : 20) / 1000);
   ch->opened_us = now_us();
   if (settings_.mic_tap) ch->tap = &settings_.mic_tap;
   MicChannel *raw = ch.get();
@@ -798,6 +821,7 @@ Snapshot Engine::snapshot() {
   s.auto_level = settings_.auto_level;
   s.max_kbps = settings_.max_kbps;
   s.max_listeners = settings_.max_listeners;
+  s.split = settings_.split;
   s.failed_connects = failed_connects_;
   s.last_failed_s = last_failed_us_ ? (now_us() - last_failed_us_) / 1e6 : -1;
   s.gain_db = level_.gain_db();

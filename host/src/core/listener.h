@@ -75,7 +75,9 @@ class Listener : public std::enable_shared_from_this<Listener> {
     std::atomic<bool> *mic_active = nullptr;
     std::atomic<int> *host_max_kbps;
     std::atomic<int> *listener_count;
-    float duck_db = 8.f;
+    // Split mode: the host's voice in the left channel, the PC's sound in the
+    // right, unmixed; the listener's page mixes them (or keeps them apart).
+    bool split = false;
   };
 
   Listener(int id, Env env);
@@ -112,6 +114,7 @@ class Listener : public std::enable_shared_from_this<Listener> {
   void on_control(const std::string &text);
   void send_ctl(const std::string &json);
   void send_stats();
+  void log_summary();
   void apply_plan(const Plan &p);
 
   const int id_;
@@ -135,7 +138,7 @@ class Listener : public std::enable_shared_from_this<Listener> {
 
   // mixing + encoding (sender thread only)
   Limiter limiter_{-1.0f, 5.f, 150.f};
-  Ducker ducker_;
+  Limiter split_voice_lim_{-1.0f, 5.f, 150.f}, split_music_lim_{-1.0f, 5.f, 150.f};  // split mode: one per source
   float g_music_ = 1.f, g_voice_ = 1.f;
   std::vector<float> pcm_;  // pending interleaved stereo for the next frame
   OpusEncoder *enc_ = nullptr;

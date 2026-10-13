@@ -230,8 +230,15 @@ bool Listener::start_relay(const std::string &url, const std::vector<uint8_t> &k
   }
   relay_key_ = key;
   relay_http_ = std::make_unique<Http>();
+  // Short attempts, several of them: some networks silently drop the first
+  // connection to one of Cloudflare's addresses (a 12 s stall here made the
+  // page give up). A fresh attempt usually lands at once.
   std::string e;
-  rws_ = relay_http_->websocket(url, 12000, &e);
+  int64_t t0 = now_us();
+  for (int attempt = 1; attempt <= 5 && !rws_ && now_us() - t0 < 18000000; ++attempt) {
+    rws_ = relay_http_->websocket(url, 3000, &e);
+    if (!rws_) LOGD("listener %d: relay connect attempt %d: %s", id_, attempt, e.c_str());
+  }
   if (!rws_) {
     if (err) *err = e;
     return false;
@@ -430,6 +437,7 @@ void Listener::sender_loop() {
         last_stat_us_ = now;
         if (state_ != State::Live) { notify_settings(); continue; }  // until the page answers
         send_stats();
+        if (++diag_ % 10 == 0) log_summary();
         // Relay rate control. Back off at once when the path shows stress: the
         // page ran dry, audio is queueing here (TCP is full), or sends block.
         // Climb by a quarter after 5 clean seconds, so a fast path reaches
@@ -481,6 +489,7 @@ void Listener::sender_loop() {
     if (now - last_stat_us_ > 1000000) {
       last_stat_us_ = now;
       send_stats();
+      if (diag_ % 10 == 9) log_summary();
       if (++diag_ % 5 == 0) {
         std::lock_guard lk(mu_);
         const Plan &p = cc_.plan();
@@ -495,13 +504,31 @@ void Listener::sender_loop() {
 }
 
 void Listener::process_block(const SourceBlock &b) {
+  if (env_.split) {
+    // Left: the host's voice. Right: the PC's sound folded to mono. Each has
+    // its own limiter, so a loud song can never pull the voice down; the
+    // listener sets both levels on their page.
+    float v[kBlock * 2], m[kBlock * 2], mix[kBlock * 2];
+    for (int i = 0; i < kBlock; ++i) {
+      float vi = b.mic_on ? b.voice[size_t(i)] : 0.f;
+      float mi = 0.5f * (b.system[2 * size_t(i)] + b.system[2 * size_t(i) + 1]);
+      v[2 * i] = v[2 * i + 1] = vi;
+      m[2 * i] = m[2 * i + 1] = mi;
+    }
+    split_voice_lim_.process(v, kBlock);
+    split_music_lim_.process(m, kBlock);
+    for (int i = 0; i < kBlock; ++i) { mix[2 * i] = v[2 * i]; mix[2 * i + 1] = m[2 * i]; }
+    pcm_.insert(pcm_.end(), mix, mix + kBlock * 2);
+    int frame_samples = kRate / 1000 * (applied_.frame_ms ? applied_.frame_ms : 20);
+    while (int(pcm_.size()) >= frame_samples * 2) encode_frame();
+    return;
+  }
   MixPrefs p;
   { std::lock_guard lk(mu_); p = prefs_; }
   float gm = p.music_mute ? 0.f : db_to_gain(std::clamp(p.music_db, -40.f, 12.f));
   float gv = (p.voice_mute || !b.mic_on) ? 0.f : db_to_gain(std::clamp(p.voice_db, -40.f, 12.f));
   float mix[kBlock * 2];
   memcpy(mix, b.system.data(), sizeof mix);
-  ducker_.process(mix, kBlock, p.duck && b.voice_active && gv > 0.f, env_.duck_db);
   // Gains ramp across the block, so moving a slider never clicks.
   for (int i = 0; i < kBlock; ++i) {
     float t = float(i) / kBlock;
@@ -525,7 +552,7 @@ void Listener::apply_plan(const Plan &p) {
   // Folding to mono is done inside the one stereo encoder, so it is seamless:
   // no new encoder, no decoder reset at the far end.
   if (p.stereo != applied_.stereo || !applied_.opus_bps)
-    opus_encoder_ctl(enc_, OPUS_SET_FORCE_CHANNELS(p.stereo ? OPUS_AUTO : 1));
+    opus_encoder_ctl(enc_, OPUS_SET_FORCE_CHANNELS(env_.split ? 2 : p.stereo ? OPUS_AUTO : 1));
   if (p.fec != applied_.fec || !applied_.opus_bps) opus_encoder_ctl(enc_, OPUS_SET_INBAND_FEC(p.fec ? 1 : 0));
   if (p.loss_pct != applied_.loss_pct || !applied_.opus_bps) opus_encoder_ctl(enc_, OPUS_SET_PACKET_LOSS_PERC(p.loss_pct));
   int complexity = env_.listener_count && *env_.listener_count > 6 ? 8 : 10;
@@ -542,6 +569,9 @@ void Listener::encode_frame() {
     caps = caps_;
     plan = relay_ ? relay_plan() : cc_.update(caps, now_us());
   }
+  // Split mode: the two channels are two different things; folding them to
+  // mono would mix them for good. Stereo at any rate.
+  if (env_.split) plan.stereo = true;
   // Frame duration only changes on a frame boundary: exactly here.
   int frame_ms = applied_.frame_ms ? applied_.frame_ms : 20;
   if (plan.opus_bps != applied_.opus_bps || plan.stereo != applied_.stereo || plan.fec != applied_.fec ||
@@ -698,10 +728,20 @@ void Listener::on_control(const std::string &text) {
     prefs_.duck = m.value("duck", prefs_.duck);
     prefs_.max_kbps = std::clamp(m.value("max_kbps", prefs_.max_kbps), 16, 320);
   } else if (t == "name") {
-    std::string nm = m.value("name", "");
+    std::string nm = m.value("name", ""), ua = m.value("ua", "");
     if (nm.size() > 40) nm.resize(40);
-    std::lock_guard lk(mu_);
-    name_ = nm;
+    if (ua.size() > 200) ua.resize(200);
+    bool first;
+    {
+      std::lock_guard lk(mu_);
+      first = name_.empty() && !nm.empty();
+      name_ = nm;
+    }
+    if (first) LOGI("listener %d: %s%s%s", id_, nm.c_str(), ua.empty() ? "" : " | ", ua.c_str());
+  } else if (t == "talk") {
+    // The listener's mic, as their browser opened it (diagnostics).
+    LOGI("listener %d: mic %s%s", id_, m.value("on", false) ? "on" : "off",
+         m.value("on", false) ? (" (" + m.value("mode", std::string("?")) + ", " + m.value("label", std::string()) + ")").c_str() : "");
   } else if (t == "ping") {
     send_ctl(json{{"t", "pong"}, {"id", m.contains("id") ? m["id"] : json(0)}}.dump());  // echo as sent: a ms timestamp overflows int
   } else if (t == "bye") {
@@ -721,7 +761,8 @@ void Listener::notify_settings() {
   json m = {{"t", "hello"}, {"v", 1}, {"name", env_.host_name},
             {"talk", env_.talk_allowed && env_.talk_allowed->load()},
             {"mic", env_.mic_on && env_.mic_on->load()},
-            {"listeners", env_.listener_count ? env_.listener_count->load() : 1}};
+            {"listeners", env_.listener_count ? env_.listener_count->load() : 1},
+            {"split", env_.split}};
   send_ctl(m.dump());
 }
 
@@ -736,6 +777,20 @@ void Listener::send_stats() {
             {"talk", env_.talk_allowed && env_.talk_allowed->load()},
             {"twcc", v.twcc}, {"nack", v.nack}, {"redcap", v.redcap}};
   send_ctl(m.dump());
+}
+
+// One line every 10 s while live: enough to tell afterwards what a listener
+// actually got (path, rate, how much their page had to fill in) and when.
+void Listener::log_summary() {
+  ListenerView v = view();
+  auto ts = talk_.stats();
+  LOGI("listener %d: %s %.0fk %s %dms frames | rtt %.0fms loss %.1f%% | their buffer %.0fms, filled in %.2f%%%s | mic %s%s",
+       id_, relay_ ? "relay" : "direct", v.opus_kbps, v.stereo ? "stereo" : "mono", v.frame_ms, v.rtt_ms, v.loss * 100,
+       v.rx_buffer_ms, v.rx_conceal * 100,
+       relay_ ? (" | queue " + std::to_string(relay_backlog_ms_.load()) + "ms, dropped " +
+                 std::to_string(relay_dropped_ms_.load()) + "ms").c_str() : "",
+       v.talking ? "talking" : "quiet", v.talking ? (" " + std::to_string(int(ts.level_db)) + " dB, buffer " +
+                                                    std::to_string(int(ts.depth_ms)) + "ms").c_str() : "");
 }
 
 ListenerView Listener::view() const {

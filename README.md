@@ -23,6 +23,7 @@ Listeners go to **https://share.mdarif.online/aoi** and type the code, or open
 | Command | What it does |
 |---|---|
 | `aoi start` | Starts detached, waits until the code is live, prints code, link and QR. Running it again just shows the code. |
+| `aoi start --split` | Split mode: your voice in the left channel, this PC's sound in the right, never mixed on the way. Each listener sets both levels and keeps them apart (voice left ear, sound right ear) or mixes them. `aoi restart --split` switches a running host. |
 | `aoi status [-w]` | Listeners and live link numbers (`-w` refreshes every second, `--json` for scripts). |
 | `aoi code` | Shows the code, link and QR again. |
 | `aoi stop` / `aoi restart` | Graceful stop (listeners are told, the code is withdrawn) in about 1 s. Forced after 6 s if ever needed. |
@@ -67,7 +68,7 @@ suppression and gain control Chrome uses):
   loopback only after mixing a period, and a raw laptop mic can deliver the
   echo of that period sooner; the canceller must see the sound before its
   echo.
-- **Voice activity** (for ducking and "talking") comes from an RNN voice
+- **Voice activity** (for the "talking" light) comes from an RNN voice
   detector on the cleaned signal, with a level floor: music, keys, a fan or
   the faint remains of a listener's voice cannot trigger it.
 
@@ -77,6 +78,14 @@ normal volume (`aoi echotest`): echo reduced by 31-46 dB, leaving it at
 level-based voice detection) music from the speakers counted as "talking": the
 clean music was ducked 8 dB while a boosted, room-delayed copy of it, and of
 the listener's own voice, went out through the mic.
+
+If Windows' input level for the mic is below 50% (7% was seen), AOI raises
+it to 100% when it opens the mic: otherwise the auto level has to add 30 dB
+or more, and the noise and every Bluetooth glitch with it.
+
+The listener's voice is cleaned up on the host as well (noise suppression and
+auto level, per listener, about 4 dB above the host's own voice level) so it
+stays clear over the music playing on the same output.
 
 Automatic device choice: a USB or wired headset mic first, then a Bluetooth LE
 Audio headset, then Windows' default mic. A classic Bluetooth headset mic is
@@ -89,9 +98,13 @@ same headset as the mic, otherwise on Windows' default output.
 - **Sound | Mic | Leave**, with the mic in the middle. Turning the mic **on**
   asks for confirmation first; turning it off is immediate.
 - **Music** (the host's speaker output) and **Voice** (the host's microphone)
-  sliders, each with mute, plus *Lower music while they talk*. The host
-  applies them to that listener's own mix (see below), so they cost no
-  bandwidth and cannot put voice and music out of sync.
+  sliders, each with mute. The host applies them to that listener's own mix
+  (see below), so they cost no bandwidth and cannot put voice and music out
+  of sync. Nothing is ever lowered automatically: no ducking.
+- In **split mode** the same sliders work on the page itself, plus *Keep them
+  apart* (on: their voice in the left ear, their PC's sound in the right;
+  off: both in both ears). The PC's sound is mono in this mode, as its
+  channel carries one side each.
 - **I'm using earphones** (on by default). The listener's mic opens raw: no
   echo cancellation, noise suppression or auto gain in the browser. Asking a
   phone for any of them puts it in "call mode", where its own voice
@@ -146,6 +159,14 @@ simulator `aoi start --simulate rate=..,loss=..,burst=..,delay=..,jitter=..`):
 | Talkback, 10 % loss + 40 ms jitter | 969/969 blocks audible |
 | Start → code live | ~0.9 s; stop ~1 s |
 
+## Diagnostics
+
+Every 10 s the log (`aoi logs`) has one line per listener: path, bitrate,
+round trip, loss, their buffer, how much of their audio had to be filled in,
+the relay queue, and whether their mic is on and how loud. When a listener
+joins it logs their browser and device; when they turn their mic on, how the
+browser opened it (echo cancellation, noise suppression, auto gain).
+
 ## Using both apps together
 
 The screen-share app (SOI) keeps `share.mdarif.online` as its Custom Domain; AOI
@@ -166,6 +187,8 @@ itself:
   The page goes straight to the relay: listening within about 1-5 s.
 - No path between two NATs: connectivity checks get no reply at all for 5 s.
 - Once a tab has needed the relay for a host, it uses it first next time.
+- The host connects to the relay in several short attempts (3 s each): some
+  networks silently drop the first connection to one Cloudflare address.
 
 How the relay works:
 

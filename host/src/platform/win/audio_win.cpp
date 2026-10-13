@@ -980,6 +980,18 @@ class WasapiSystem final : public IAudioSystem {
   int subscribe(EventSink sink) override { return notifier().add(std::move(sink)); }
   void unsubscribe(int token) override { notifier().remove(token); }
 
+  bool set_input_volume(const std::string &id, float level) override {
+    ComInit com;
+    Com<IMMDeviceEnumerator> en;
+    Com<IMMDevice> dev;
+    Com<IAudioEndpointVolume> vol;
+    if (FAILED(make_enumerator(en)) || FAILED(open_device(en.p, id, eCapture, &dev)) ||
+        FAILED(dev->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, reinterpret_cast<void **>(&vol))))
+      return false;
+    vol->SetMute(FALSE, nullptr);
+    return SUCCEEDED(vol->SetMasterVolumeLevelScalar(std::clamp(level, 0.f, 1.f), nullptr));
+  }
+
   std::optional<float> input_volume(const std::string &id) override {
     ComInit com;
     Com<IMMDeviceEnumerator> en;

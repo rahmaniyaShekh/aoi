@@ -17,6 +17,7 @@ TalkStream::TalkStream(bool clean_voice) {
   o.aec = false;  // echo at the listener's end is their browser's job (it cancels when they use a speaker)
   o.gentle_ns = true;
   o.initial_gain_db = 6.f;
+  o.post_gain_db = 2.f;  // ~-14 dBFS speech: clear over the owner's music on the same output (the safety knee holds peaks)
   vp_ = std::make_unique<VoiceProcessor>(o);
 }
 

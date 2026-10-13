@@ -97,6 +97,8 @@ class IAudioSystem {
 
   // The endpoint's own input level (0..1) as set in the OS sound settings.
   virtual std::optional<float> input_volume(const std::string &device_id) = 0;
+  // Sets it (0..1) and unmutes. False if the device has no such control.
+  virtual bool set_input_volume(const std::string &device_id, float level) = 0;
 };
 
 std::unique_ptr<IAudioSystem> create_audio_system();

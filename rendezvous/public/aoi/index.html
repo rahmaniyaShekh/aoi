@@ -179,9 +179,9 @@
     <section class="group">
       <p class="gt">Mix</p>
       <div class="row" id="rowVol"><div class="nm">Volume</div><input type="range" id="vol" min="0" max="100" value="100" aria-label="Volume"><button class="val" id="volVal" type="button">100%</button></div>
-      <div class="row" id="rowMusic"><div class="nm">Music<small>their speaker</small></div><input type="range" id="music" min="-30" max="10" step="1" value="0" aria-label="Their speaker level"><button class="val" id="musicVal" type="button" title="Mute / unmute">0 dB</button></div>
+      <div class="row" id="rowMusic"><div class="nm" id="musicName">Music<small id="musicSub">their speaker</small></div><input type="range" id="music" min="-30" max="10" step="1" value="0" aria-label="Their speaker level"><button class="val" id="musicVal" type="button" title="Mute / unmute">0 dB</button></div>
       <div class="row" id="rowVoice"><div class="nm">Voice<small id="voiceSub">their mic</small></div><input type="range" id="voice" min="-30" max="10" step="1" value="0" aria-label="Their microphone level"><button class="val" id="voiceVal" type="button" title="Mute / unmute">0 dB</button></div>
-      <button class="check" id="duck" type="button" role="switch" aria-checked="true"><span>Lower music while they talk<small>keeps their voice clear</small></span><span class="sw"></span></button>
+      <button class="check" id="apart" type="button" role="switch" aria-checked="true" hidden><span>Keep them apart<small>their voice in your left ear, their PC's sound in the right</small></span><span class="sw"></span></button>
     </section>
 
     <section class="group">
@@ -279,7 +279,7 @@ function rememberHost(code, name) {       // only ever called once audio actuall
   list.unshift({ code, name: (prev?.custom ? prev.name : (name || prev?.name || '')).trim(), custom: !!prev?.custom, at: Date.now() });
   saveJSON(STORE, list.slice(0, 12));
 }
-const defaults = { music_db: 0, voice_db: 0, music_mute: false, voice_mute: false, duck: true, mode: 'balanced', saver: false, vol: 100, earphones: true };
+const defaults = { music_db: 0, voice_db: 0, music_mute: false, voice_mute: false, mode: 'balanced', saver: false, vol: 100, earphones: true, apart: true };
 let prefs = Object.assign({}, defaults, loadJSON(PREFS, {}));
 const savePrefs = () => saveJSON(PREFS, prefs);
 
@@ -309,6 +309,13 @@ function deviceName() {
   if (/Mac/.test(ua)) return 'Mac';
   if (/Windows/.test(ua)) return 'Windows PC';
   return 'Browser';
+}
+// Who we are, for the host's log: which browser on which device.
+function sayName() { send({ t: 'name', name: deviceName(), ua: navigator.userAgent }); }
+function sayTalk(on) {
+  const st = S.talkTrack?.getSettings?.() || {};
+  send({ t: 'talk', on, label: S.talkTrack?.label || '',
+    mode: on ? `${prefs.earphones ? 'earphones' : 'speaker'}: ec ${st.echoCancellation} ns ${st.noiseSuppression} agc ${st.autoGainControl}${S.relay ? ', relay' : ''}` : '' });
 }
 function renderSaved() {
   const list = loadSaved(), ul = $('saved');
@@ -370,6 +377,7 @@ function stopAll() {
   if (S.dc && S.dc.readyState === 'open') { try { S.dc.send(JSON.stringify({ t: 'bye' })); } catch { } }
   try { S.pc?.close(); } catch { }
   relayClose();
+  splitClose();
   S.pc = S.dc = null; S.live = false;
   clearInterval(S.statTimer);
   $('player').srcObject = null;
@@ -514,6 +522,7 @@ async function attempt(id, code, room, gen, onLive) {
   try { sdp = await openBlob(room.offer, code); } catch (e) { return e.message === 'wrong code' ? 'badcode' : 'failed'; }
   if (gen !== generation) return 'aborted';
   status('Connecting…');
+  splitClose();  // a new connection: split mode re-routes it once the host says hello
   const servers = await iceServers();
   const canRelay = (room.caps || []).includes('relay') && relaySupported();
   const udp = canRelay ? probeUdp(servers) : Promise.resolve(true);
@@ -533,10 +542,10 @@ async function attempt(id, code, room, gen, onLive) {
   pc.ondatachannel = ev => {
     const dc = ev.channel;
     S.dc = dc;
-    dc.onopen = () => { send({ t: 'name', name: deviceName() }); sendPrefs(); };
+    dc.onopen = () => { sayName(); sendPrefs(); };
     dc.onmessage = e => {
       let m; try { m = JSON.parse(e.data); } catch { return; }
-      if (m.t === 'hello') { S.hello = m; S.name = m.name || ''; renderHost(); }
+      if (m.t === 'hello') { S.hello = m; S.name = m.name || ''; renderHost(); sendPrefs(); }
       else if (m.t === 'stat') { S.hostStat = m; renderHost(); }
       else if (m.t === 'bye') { byeReason = m.reason || ''; done.resolve('bye'); }
     };
@@ -625,7 +634,7 @@ function send(o) {
 // through a small jitter buffer (relay-worklet.js) into the same <audio>
 // element the direct path uses, so every control works the same.
 const relaySupported = () => 'AudioDecoder' in window && 'AudioWorkletNode' in window && 'WebSocket' in window;
-let relayChain = Promise.resolve();
+let relayChain = Promise.resolve(), R_dest = null;
 
 function relaySend(type, payload) {
   const R = S.relay;
@@ -641,6 +650,7 @@ function relaySend(type, payload) {
 function relayClose() {
   const R = S.relay;
   if (!R) return;
+  if (S.split && S.split.src === R.player) splitClose();
   S.relay = null;
   try { R.ws.close(); } catch { }
   try { R.decoder.state !== 'closed' && R.decoder.close(); } catch { }
@@ -650,6 +660,7 @@ function relayClose() {
 
 async function relayAttempt(id, code, room, gen, onLive) {
   status('Connecting through the relay…');
+  splitClose();
   const raw = crypto.getRandomValues(new Uint8Array(32));
   let answer;
   try { answer = await sealBlob(JSON.stringify({ relay: 1, key: b64urlEncode(raw) }), code); } catch { return 'failed'; }
@@ -667,12 +678,13 @@ async function relayAttempt(id, code, room, gen, onLive) {
     processorOptions: { inRate: 48000, targetMs: relayFloor() } });
   const dest = ctx.createMediaStreamDestination();
   player.connect(dest);
+  R_dest = dest;
   S.analyser = ctx.createAnalyser(); S.analyser.fftSize = 2048; S.analyser.smoothingTimeConstant = 0.8;
   player.connect(S.analyser);
 
   const done = deferred();
   let gotPcm = false, byeReason = '';
-  const R = { ws: null, key, player, decoder: null, bytes: 0, report: null, prevReport: null, rtt: 0, target: relayFloor(),
+  const R = { ws: null, key, player, dest: R_dest, decoder: null, bytes: 0, report: null, prevReport: null, rtt: 0, target: relayFloor(),
     cleanSince: Date.now(), ready: 0 };
   R.decoder = new AudioDecoder({
     output: ad => {
@@ -715,11 +727,11 @@ async function relayAttempt(id, code, room, gen, onLive) {
     } else if (plain[0] === 2) {
       let m; try { m = JSON.parse(new TextDecoder().decode(plain.subarray(1))); } catch { return; }
       if (m.t === 'hello') {
-        S.hello = m; S.name = m.name || ''; renderHost();
+        S.hello = m; S.name = m.name || ''; renderHost(); applySplit();
         // The host may have joined the relay after our first hello was sent
         // (the server keeps nothing for an absent peer): answer every hello
         // until audio flows, or both sides would wait for each other.
-        if (!gotPcm) { send({ t: 'name', name: deviceName() }); sendPrefs(); }
+        if (!gotPcm) { sayName(); sendPrefs(); }
       }
       else if (m.t === 'stat') { S.hostStat = m; renderHost(); }
       else if (m.t === 'pong') { R.rtt = Date.now() - m.id; }
@@ -731,7 +743,7 @@ async function relayAttempt(id, code, room, gen, onLive) {
   ws.onclose = () => done.resolve(S.live ? 'dropped' : 'failed');
   ws.onopen = () => {
     // Say hello until audio arrives: the host may join the relay after us.
-    const hi = () => { send({ t: 'name', name: deviceName() }); sendPrefs(); };
+    const hi = () => { sayName(); sendPrefs(); };
     hi();
     R.ready = setInterval(() => { if (gotPcm) clearInterval(R.ready); else hi(); }, 1000);
   };
@@ -749,7 +761,7 @@ async function relayAttempt(id, code, room, gen, onLive) {
   sessionStorage.setItem('aoi.relay.' + code, '1');
   S.stream = dest.stream;
   const p = $('player');
-  p.srcObject = dest.stream;
+  if (!S.split) p.srcObject = dest.stream;
   p.volume = prefs.vol / 100;
   p.play().then(() => { $('tap').hidden = true; }).catch(() => { $('tap').hidden = false; });
   onLive();
@@ -795,8 +807,64 @@ function relayStats() {
   renderStats();
 }
 function sendPrefs() {
-  send({ t: 'prefs', music_db: prefs.music_db, voice_db: prefs.voice_db, music_mute: prefs.music_mute, voice_mute: prefs.voice_mute,
-    duck: prefs.duck, max_kbps: prefs.saver ? 48 : 256 });
+  const local = !!S.hello?.split;  // split mode: both levels are applied on this page
+  send({ t: 'prefs', music_db: local ? 0 : prefs.music_db, voice_db: local ? 0 : prefs.voice_db,
+    music_mute: local ? false : prefs.music_mute, voice_mute: local ? false : prefs.voice_mute,
+    duck: false, max_kbps: prefs.saver ? 48 : 256 });
+  applySplit();
+}
+
+// ============================================================================
+// Split mode (the host started with --split): their voice arrives in the left
+// channel and their PC's sound in the right, never mixed on the way. Here each
+// gets its own level, and they either stay apart (voice left ear, sound right
+// ear) or are mixed into both ears.
+// ============================================================================
+function applySplit() {
+  const on = !!S.hello?.split;
+  $('apart').hidden = !on;
+  $('musicName').firstChild.textContent = on ? 'Sound' : 'Music';
+  $('musicSub').textContent = on ? (prefs.apart ? "their PC's sound · right" : "their PC's sound") : 'their speaker';
+  if (!S.hello?.split || !S.ctx) return;
+  const ctx = S.ctx;
+  let X = S.split;
+  if (!X) {
+    // The source: the decoded relay stream, or the WebRTC track (which Chrome
+    // only feeds to Web Audio while some element is playing it, muted here).
+    let src;
+    if (S.relay) { src = S.relay.player; try { src.disconnect(S.relay.dest); } catch { } }
+    else if (S.stream) {
+      S.sink = S.sink || new Audio();
+      S.sink.muted = true; S.sink.srcObject = S.stream; S.sink.play().catch(() => { });
+      src = ctx.createMediaStreamSource(S.stream);
+    } else return;
+    X = S.split = { src, sp: ctx.createChannelSplitter(2), gv: ctx.createGain(), gm: ctx.createGain(),
+      mg: ctx.createChannelMerger(2), out: ctx.createMediaStreamDestination(), apart: null };
+    src.connect(X.sp);
+    X.sp.connect(X.gv, 0); X.sp.connect(X.gm, 1);
+    X.mg.connect(X.out);
+    if (S.analyser) { try { X.mg.connect(S.analyser); } catch { } }
+    const p = $('player');
+    p.srcObject = X.out.stream;
+    p.play().then(() => { $('tap').hidden = ctx.state === 'running'; }).catch(() => { $('tap').hidden = false; });
+  }
+  const now = ctx.currentTime;
+  const db = v => Math.pow(10, v / 20);
+  const both = prefs.apart ? 1 : 0.7;  // mixed: -3 dB each so the sum stays clear of clipping
+  X.gv.gain.setTargetAtTime(prefs.voice_mute ? 0 : db(prefs.voice_db) * both, now, 0.02);
+  X.gm.gain.setTargetAtTime(prefs.music_mute ? 0 : db(prefs.music_db) * both, now, 0.02);
+  if (X.apart !== prefs.apart) {
+    X.gv.disconnect(); X.gm.disconnect();
+    if (prefs.apart) { X.gv.connect(X.mg, 0, 0); X.gm.connect(X.mg, 0, 1); }
+    else { for (const g of [X.gv, X.gm]) { g.connect(X.mg, 0, 0); g.connect(X.mg, 0, 1); } }
+    X.apart = prefs.apart;
+  }
+}
+function splitClose() {
+  const X = S.split;
+  S.split = null;
+  if (X) { try { X.src.disconnect(); X.mg.disconnect(); } catch { } }
+  if (S.sink) { S.sink.srcObject = null; }
 }
 
 // ============================================================================
@@ -1016,6 +1084,7 @@ async function beginTalk() {
     $('micBtn').classList.add('live'); $('micBtn').setAttribute('aria-pressed', 'true');
     $('micLbl').textContent = 'Mic on';
     meterTalk(ms);
+    sayTalk(true);
   } catch (e) {
     $('micLbl').textContent = 'No mic access';
     if (!S.talkTrack) audioSession('playback');
@@ -1047,23 +1116,23 @@ async function beginRelayTalk() {
     });
     enc.configure(cfg);
     const src = ctx.createMediaStreamSource(ms);
-    const cap = new AudioWorkletNode(ctx, 'aoi-capture');
+    const frame = Math.round(rate / 50);
+    const cap = new AudioWorkletNode(ctx, 'aoi-capture', { processorOptions: { frame } });
     const sink = ctx.createGain(); sink.gain.value = 0;
     src.connect(cap); cap.connect(sink); sink.connect(ctx.destination);
-    const frame = Math.round(rate / 50);
-    let acc = new Float32Array(0), t = 0;
+    // One whole 20 ms frame per message (50 a second, not 375), straight to
+    // the encoder: on a phone the page's thread also decodes the host's audio.
+    let t = 0;
     cap.port.onmessage = e => {
-      const a = new Float32Array(acc.length + e.data.length); a.set(acc); a.set(e.data, acc.length); acc = a;
-      while (acc.length >= frame && enc.state === 'configured') {
-        const pcm = acc.slice(0, frame); acc = acc.slice(frame);
-        enc.encode(new AudioData({ format: 'f32', sampleRate: rate, numberOfFrames: frame, numberOfChannels: 1, timestamp: t, data: pcm }));
-        t += frame * 1e6 / rate;
-      }
+      if (enc.state !== 'configured') return;
+      enc.encode(new AudioData({ format: 'f32', sampleRate: rate, numberOfFrames: frame, numberOfChannels: 1, timestamp: t, data: e.data }));
+      t += frame * 1e6 / rate;
     };
     S.relayTalk = { enc, src, cap, sink };
     $('micBtn').classList.add('live'); $('micBtn').setAttribute('aria-pressed', 'true');
     $('micLbl').textContent = 'Mic on';
     meterTalk(ms);
+    sayTalk(true);
   } catch (e) {
     $('micLbl').textContent = 'No mic access';
     if (!S.talkTrack) audioSession('playback');
@@ -1073,6 +1142,7 @@ async function beginRelayTalk() {
 function endTalk() {
   if (!S.talkTrack) return;
   audioSession('playback');
+  sayTalk(false);
   if (S.relayTalk) {
     const T = S.relayTalk; S.relayTalk = null;
     try { T.src.disconnect(); T.cap.disconnect(); T.sink.disconnect(); } catch { }
@@ -1116,7 +1186,7 @@ function renderPrefs() {
   $('voice').value = prefs.voice_db; $('voiceVal').textContent = prefs.voice_mute ? 'muted' : fmtDb(prefs.voice_db);
   $('rowMusic').classList.toggle('dim', prefs.music_mute);
   if (!$('voice').disabled) $('rowVoice').classList.toggle('dim', prefs.voice_mute);
-  $('duck').setAttribute('aria-checked', String(prefs.duck));
+  $('apart').setAttribute('aria-checked', String(prefs.apart));
   $('ear').setAttribute('aria-checked', String(prefs.earphones));
   $('saver').setAttribute('aria-checked', String(prefs.saver));
   for (const b of $('mode').children) b.setAttribute('aria-pressed', String(b.dataset.m === prefs.mode));
@@ -1134,7 +1204,7 @@ $('music').oninput = e => { prefs.music_db = +e.target.value; prefs.music_mute =
 $('voice').oninput = e => { prefs.voice_db = +e.target.value; prefs.voice_mute = false; prefChanged(); };
 $('musicVal').onclick = () => { prefs.music_mute = !prefs.music_mute; prefChanged(); };
 $('voiceVal').onclick = () => { prefs.voice_mute = !prefs.voice_mute; prefChanged(); };
-$('duck').onclick = () => { prefs.duck = !prefs.duck; prefChanged(); };
+$('apart').onclick = () => { prefs.apart = !prefs.apart; prefChanged(); };
 $('ear').onclick = async () => {
   prefs.earphones = !prefs.earphones; prefChanged();
   if (S.talkTrack) { endTalk(); await beginTalk(); }  // reopen the mic the new way

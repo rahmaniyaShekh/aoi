@@ -76,9 +76,28 @@ class AoiPlayer extends AudioWorkletProcessor {
 }
 
 class AoiCapture extends AudioWorkletProcessor {
+  constructor(options) {
+    super();
+    this.frame = (options && options.processorOptions && options.processorOptions.frame) || 960;
+    this.buf = new Float32Array(this.frame);
+    this.n = 0;
+  }
+  // Collects whole frames here, on the audio thread, and hands each over
+  // without a copy.
   process(inputs) {
     const ch = inputs[0] && inputs[0][0];
-    if (ch && ch.length) this.port.postMessage(ch.slice(0));
+    if (!ch) return true;
+    let i = 0;
+    while (i < ch.length) {
+      const k = Math.min(ch.length - i, this.frame - this.n);
+      this.buf.set(ch.subarray(i, i + k), this.n);
+      this.n += k; i += k;
+      if (this.n === this.frame) {
+        this.port.postMessage(this.buf, [this.buf.buffer]);
+        this.buf = new Float32Array(this.frame);
+        this.n = 0;
+      }
+    }
     return true;
   }
 }

@@ -50,7 +50,7 @@ json snapshot_json(const Snapshot &s) {
                 {"echo_in_dbfs", v.echo_in_dbfs}, {"echo_out_dbfs", v.echo_out_dbfs}};
   return {{"code", s.code}, {"pretty", s.pretty}, {"link", s.link}, {"status", s.status}, {"error", s.error},
           {"mic_dev", dev(s.mic_dev)}, {"speaker_dev", dev(s.speaker_dev)}, {"echo_reference", s.echo_reference},
-          {"mic_volume", opt(s.mic_volume)}, {"mic_switching", s.mic_switching}, {"voice", voice},
+          {"mic_volume", opt(s.mic_volume)}, {"mic_switching", s.mic_switching}, {"voice", voice}, {"split", s.split},
           {"published", s.published}, {"socket", s.socket}, {"turn", s.turn}, {"source", s.source},
           {"process_loopback", s.process_loopback}, {"mic", s.mic}, {"mic_name", s.mic_name},
           {"mic_active", s.mic_active}, {"mic_level_db", s.mic_level_db}, {"talkback", s.talkback},

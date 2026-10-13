@@ -19,7 +19,6 @@
 namespace aoi {
 
 namespace {
-constexpr float kPostGainDb = -2.f;  // AGC2's limiter peaks at full scale; keep 2 dB of headroom after it
 constexpr float kExpanderDepthDb = 8.f;
 const float kSpeechFloor = std::pow(10.f, -45.f / 20.f);
 
@@ -193,7 +192,7 @@ void VoiceProcessor::process(float *x) {
     float *dst[1] = {x};
     if (m.opt.aec && echo_on_) m.apm->set_stream_delay_ms(delay_ms_);
     m.apm->ProcessStream(src, sc, sc, dst);
-    float pg = m.opt.agc ? db_to_gain(kPostGainDb) : 1.f;
+    float pg = m.opt.agc ? db_to_gain(m.opt.post_gain_db) : 1.f;
     for (int i = 0; i < kFrames; ++i) { x[i] *= pg; m.s16[i] = x[i] * 32768.f; }
     prob = m.vad->Analyze(webrtc::DeinterleavedView<const float>(m.s16.data(), kFrames, 1));
   } else
@@ -260,7 +259,7 @@ void VoiceProcessor::process(float *x) {
   s.voice = voice_;
   s.in_speech_dbfs = float(m.in_lvl);
   s.out_speech_dbfs = float(m.out_lvl);
-  s.gain_db = m.speech_s > 0 ? float(m.out_lvl - m.in_lvl - (m.opt.agc ? kPostGainDb : 0.f)) : m.opt.initial_gain_db;
+  s.gain_db = m.speech_s > 0 ? float(m.out_lvl - m.in_lvl - (m.opt.agc ? m.opt.post_gain_db : 0.f)) : m.opt.initial_gain_db;
   s.speech_seconds = m.speech_s;
   if (m.echo_n > 100 && m.echo_in > 0) {  // at least a second of echo-only audio
     s.echo_in_dbfs = float(10 * std::log10(m.echo_in / m.echo_n + 1e-20));

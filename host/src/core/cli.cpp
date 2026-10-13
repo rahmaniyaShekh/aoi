@@ -186,6 +186,8 @@ void print_status(const json &st) {
     outf("    %-10s off\n", "Talkback");
   outf("    %-10s up to %d kbps, adapts per listener%s\n", "Quality", st.value("max_kbps", 256),
        st.value("turn", false) ? " · relay available" : "");
+  if (st.value("split", false))
+    outf("    %-10s split: your voice left, this PC's sound right (listeners mix them)\n", "Mode");
   int live_n = 0;
   for (auto &l : st["listeners"]) live_n += l.value("state", "") == "live";
   outf("\n    %sListeners %d/%d%s\n", C_BOLD, live_n, st.value("max_listeners", 2), C_RST);
@@ -226,7 +228,7 @@ std::vector<std::string> passthrough(const std::vector<std::string> &args) {
   for (size_t i = 0; i < args.size(); ++i) {
     const std::string &a = args[i];
     if ((a == "--simulate" || a == "--service") && i + 1 < args.size()) { o.push_back(a); o.push_back(args[++i]); }
-    else if (a == "--new-code" || a == "--verbose") o.push_back(a);
+    else if (a == "--new-code" || a == "--verbose" || a == "--split") o.push_back(a);
   }
   return o;
 }
@@ -242,6 +244,8 @@ void apply_flags(Settings &s, const std::vector<std::string> &args) {
       s.new_code = true;
     } else if (a == "--verbose") {
       g_verbose = true;
+    } else if (a == "--split") {
+      s.split = true;
     }
   }
 }
@@ -274,6 +278,7 @@ int serve(const std::vector<std::string> &args, bool foreground) {
   apply_flags(s, args);
   LOGI("aoi %s starting (pid %d)%s", AOI_VERSION, current_pid(), foreground ? " in foreground" : "");
   if (s.sim.active()) LOGW("network simulator active: %s", s.sim.describe().c_str());
+  if (s.split) LOGI("split mode: your voice in the left channel, this PC's sound in the right; listeners mix them");
   write_file_atomic(data_dir() / "aoi.pid", std::to_string(current_pid()));
   cleanup_old_copies();  // leftovers from an update, unlocked now
   on_interrupt([] { g_stop.fire(); });
@@ -645,6 +650,7 @@ int cmd_uninstall(bool purge) {
 int cmd_help() {
   outf("\n  %sAOI%s %s - share this PC's audio over the internet\n\n", C_BOLD, C_RST, AOI_VERSION);
   out("    aoi start             start sharing in the background; prints code, link and QR\n"
+      "    aoi start --split     your voice left, this PC's sound right: each listener mixes them\n"
       "    aoi status [-w]       who is listening and how well (-w: live)\n"
       "    aoi code              show the code, link and QR again\n"
       "    aoi stop              stop sharing (also: taskkill /im aoi.exe)\n"
