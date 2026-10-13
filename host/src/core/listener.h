@@ -16,6 +16,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -63,6 +64,17 @@ struct ListenerView {
   double connected_s = 0;
 };
 
+// Where relay messages travel: the host's own signalling socket (no second
+// connection to open), or a WebSocket of their own.
+class RelayPipe {
+ public:
+  virtual ~RelayPipe() = default;
+  virtual bool send(const uint8_t *p, size_t n) = 0;  // false: the relay is gone
+  virtual std::optional<std::string> receive() = 0;   // blocks; nullopt once closed
+  virtual void close() = 0;
+  virtual const char *kind() const = 0;
+};
+
 class Listener : public std::enable_shared_from_this<Listener> {
  public:
   enum class State { Offering, Connecting, Live, Closed };
@@ -90,7 +102,10 @@ class Listener : public std::enable_shared_from_this<Listener> {
   bool set_answer(const std::string &sdp, std::string *err);
   // Relay instead of a direct WebRTC path: the listener asked for it because
   // its network could not reach ours. `url` is the relay WebSocket endpoint.
-  bool start_relay(const std::string &url, const std::vector<uint8_t> &key, std::string *err);
+  // `rdv`/`session`: relay over the host's signalling socket when the server
+  // supports it; otherwise (or on failure) over a connection of its own.
+  bool start_relay(const std::string &url, const std::vector<uint8_t> &key, std::string *err,
+                   std::weak_ptr<Rendezvous> rdv = {}, const std::string &session = {});
   bool relayed() const { return relay_; }
   void close(const std::string &reason);
   void shutdown();  // engine thread only
@@ -127,7 +142,7 @@ class Listener : public std::enable_shared_from_this<Listener> {
   std::shared_ptr<rtc::DataChannel> dc_;
   std::unique_ptr<NetSim> sim_;
   std::atomic<State> state_{State::Offering};
-  std::atomic<bool> closing_{false}, dc_open_{false}, shut_{false};
+  std::atomic<bool> closing_{false}, dc_open_{false}, shut_{false}, media_up_{false};
   std::atomic<int64_t> last_ctl_us_{0}, disconnected_since_{0}, live_since_{0}, answered_us_{0};
   std::string close_reason_;
 
@@ -195,8 +210,7 @@ class Listener : public std::enable_shared_from_this<Listener> {
   Plan relay_plan();
   std::atomic<bool> relay_{false};
   std::vector<uint8_t> relay_key_;
-  std::unique_ptr<Http> relay_http_;
-  std::unique_ptr<WebSocket> rws_;
+  std::unique_ptr<RelayPipe> pipe_;
   std::thread relay_thread_, relay_tx_thread_;
   // Sealed messages waiting for the socket. Sending blocks while TCP is
   // full, so it has a thread of its own: the encoder never waits, stale

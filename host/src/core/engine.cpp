@@ -383,7 +383,7 @@ void Engine::host_loop() {
         rotate_ = false;
       }
       published_ = false;
-      rdv_ = std::make_unique<Rendezvous>(settings_.service, sha256_hex(code_), owner_, host_name);
+      rdv_ = std::make_shared<Rendezvous>(settings_.service, sha256_hex(code_), owner_, host_name);
       rdv_->start();
       ice_at = 0;
     }
@@ -472,7 +472,7 @@ void Engine::host_loop() {
       }
       std::string url = settings_.service + "/api/room/" + sha256_hex(code_) + "/relay?session=" + session +
                         "&role=host&owner=" + owner_;
-      if (!l->start_relay(url, *key, &why)) {
+      if (!l->start_relay(url, *key, &why, rdv_, session)) {
         LOGW("relay not started: %s", why.c_str());
         l->shutdown();
         continue;

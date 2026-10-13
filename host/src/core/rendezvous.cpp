@@ -35,10 +35,10 @@ void Rendezvous::stop() {
   if (stop_.exchange(true)) return;
   // Close outside the lock: the socket thread needs mu_ to finish, and
   // closing waits for its pending receive.
-  WebSocket *ws = nullptr;
+  std::shared_ptr<WebSocket> ws;
   {
     std::lock_guard lk(mu_);
-    ws = ws_.get();
+    ws = ws_;
   }
   if (ws) ws->close();
   cv_.notify_all();
@@ -47,17 +47,64 @@ void Rendezvous::stop() {
 }
 
 bool Rendezvous::send_json(const std::string &s) {
-  std::lock_guard lk(mu_);
-  return ws_ && ws_->send(s);
+  std::shared_ptr<WebSocket> ws;
+  {
+    std::lock_guard lk(mu_);
+    ws = ws_;
+  }
+  return ws && ws->send(s);  // outside the lock: a send can block on a slow uplink
+}
+
+bool Rendezvous::relay_join(const std::string &session, RelaySub sub, int timeout_ms) {
+  {
+    std::lock_guard lk(mu_);
+    relays_[session] = std::move(sub);
+    relay_ok_.erase(session);
+  }
+  if (!ws_up_ || !send_json(json{{"t", "rj"}, {"session", session}}.dump())) { relay_leave(session); return false; }
+  std::unique_lock lk(mu_);
+  if (cv_.wait_for(lk, std::chrono::milliseconds(timeout_ms), [&] { return relay_ok_.count(session) || stop_; }) &&
+      relay_ok_.count(session))
+    return true;
+  lk.unlock();
+  relay_leave(session);
+  return false;
+}
+
+bool Rendezvous::relay_send(const std::string &session, const uint8_t *p, size_t n) {
+  std::shared_ptr<WebSocket> ws;
+  {
+    std::lock_guard lk(mu_);
+    ws = ws_;
+  }
+  if (!ws || !ws_up_) return false;
+  std::string out;
+  out.reserve(16 + n);
+  out.append(session);
+  out.append(reinterpret_cast<const char *>(p), n);
+  return ws->send_binary(out.data(), out.size());
+}
+
+void Rendezvous::relay_leave(const std::string &session) {
+  bool had;
+  {
+    std::lock_guard lk(mu_);
+    had = relays_.erase(session) > 0;
+    relay_ok_.erase(session);
+  }
+  if (had && ws_up_) send_json(json{{"t", "rx"}, {"session", session}}.dump());
 }
 
 void Rendezvous::socket_loop() {
   // WinHTTP performs the upgrade on an https:// request.
   std::string upgrade = base_ + "/api/room/" + room_ + "/host?owner=" + owner_;
-  int backoff = 1000;
+  // Short attempts and short waits between them: on a network that drops
+  // some new connections, the next attempt usually lands at once, and every
+  // second without the socket is a second a listener waits.
+  int backoff = 500;
   while (!stop_) {
     std::string err;
-    auto ws = http_.websocket(upgrade, 12000, &err);
+    std::shared_ptr<WebSocket> ws = http_.websocket(upgrade, 5000, &err);
     if (!ws) {
       {
         std::lock_guard lk(mu_);
@@ -67,37 +114,66 @@ void Rendezvous::socket_loop() {
       LOGW("rendezvous socket failed: %s (falling back to polling)", err.c_str());
       std::unique_lock lk(mu_);
       cv_.wait_for(lk, std::chrono::milliseconds(backoff), [&] { return stop_.load(); });
-      backoff = std::min(backoff * 2, 30000);
+      backoff = std::min(backoff * 2, 8000);
       continue;
     }
-    WebSocket *raw = ws.get();
+    std::shared_ptr<WebSocket> raw = ws;
     std::string session;
+    std::vector<std::string> rejoin;
     {
       std::lock_guard lk(mu_);
       ws_ = std::move(ws);
       ws_failures_ = 0;
       last_error_.clear();
       session = current_session_;
+      for (auto &kv : relays_) rejoin.push_back(kv.first);
     }
     ws_up_ = true;
-    backoff = 1000;
+    backoff = 500;
     LOGI("rendezvous socket connected");
     // Anything pushed while we were away is still stored: ask for it.
     if (!session.empty()) send_json(json{{"t", "get"}, {"session", session}}.dump());
+    // Relays that were running over the old socket carry on over this one.
+    for (auto &s : rejoin) send_json(json{{"t", "rj"}, {"session", s}}.dump());
     cv_.notify_all();
 
     while (!stop_) {
-      auto msg = raw->receive();
+      bool bin = false;
+      auto msg = raw->receive(&bin);
       if (!msg) break;
+      if (bin) {
+        // Relay traffic: [16-character session][the listener's message].
+        if (msg->size() <= 16) continue;
+        std::function<void(std::string &&)> fn;
+        {
+          std::lock_guard lk(mu_);
+          auto it = relays_.find(msg->substr(0, 16));
+          if (it != relays_.end()) fn = it->second.on_msg;
+        }
+        if (fn) fn(msg->substr(16));
+        continue;
+      }
       if (*msg == "pong") continue;
       json m = json::parse(*msg, nullptr, false);
       if (m.is_discarded() || !m.is_object()) continue;
       std::string t = m.value("t", "");
+      if (t == "rc") {  // the listener's side of a relay closed
+        std::function<void()> fn;
+        {
+          std::lock_guard lk(mu_);
+          auto it = relays_.find(m.value("session", ""));
+          if (it != relays_.end()) fn = it->second.on_closed;
+        }
+        if (fn) fn();
+        continue;
+      }
       std::lock_guard lk(mu_);
       if (t == "ans") {
         answers_[m.value("session", "")] = m.value("answer", "");
       } else if (t == "ok" || t == "err") {
         replies_[m.value("rid", 0)] = t == "ok" ? "ok" : m.value("error", "error");
+      } else if (t == "rj") {
+        relay_ok_.insert(m.value("session", ""));
       }
       cv_.notify_all();
     }

@@ -44,6 +44,92 @@ std::string audio_section(const std::string &sdp) {
   auto b = sdp.find("\nm=", a + 1);
   return sdp.substr(a, b == std::string::npos ? std::string::npos : b - a);
 }
+// Relay over the host's signalling socket: the server forwards the
+// listener's messages there, prefixed with the session.
+class MuxPipe final : public RelayPipe {
+ public:
+  MuxPipe(std::weak_ptr<Rendezvous> rdv, std::string session) : rdv_(std::move(rdv)), session_(std::move(session)) {}
+  ~MuxPipe() override { close(); }
+  bool open(int timeout_ms) {
+    auto r = rdv_.lock();
+    if (!r || !r->socket_up()) return false;
+    auto q = q_;
+    Rendezvous::RelaySub sub{
+        [q](std::string &&m) {
+          std::lock_guard lk(q->mu);
+          if (q->items.size() < 500) q->items.push_back(std::move(m));
+          q->cv.notify_one();
+        },
+        [q] {
+          std::lock_guard lk(q->mu);
+          q->closed = true;
+          q->cv.notify_all();
+        }};
+    joined_ = r->relay_join(session_, std::move(sub), timeout_ms);
+    return joined_;
+  }
+  bool send(const uint8_t *p, size_t n) override {
+    if (q_->closed) return false;
+    auto r = rdv_.lock();
+    if (!r) return false;
+    // The socket may be reconnecting: this message is lost, the page's
+    // buffer rides over it, and the relay carries on when it is back.
+    r->relay_send(session_, p, n);
+    return true;
+  }
+  std::optional<std::string> receive() override {
+    std::unique_lock lk(q_->mu);
+    q_->cv.wait(lk, [&] { return q_->closed || !q_->items.empty(); });
+    if (q_->items.empty()) return std::nullopt;
+    std::string m = std::move(q_->items.front());
+    q_->items.pop_front();
+    return m;
+  }
+  void close() override {
+    {
+      std::lock_guard lk(q_->mu);
+      q_->closed = true;
+    }
+    q_->cv.notify_all();
+    if (joined_) {
+      joined_ = false;
+      if (auto r = rdv_.lock()) r->relay_leave(session_);
+    }
+  }
+  const char *kind() const override { return "the host's server connection"; }
+
+ private:
+  struct Queue {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<std::string> items;
+    bool closed = false;
+  };
+  std::weak_ptr<Rendezvous> rdv_;
+  std::string session_;
+  std::shared_ptr<Queue> q_ = std::make_shared<Queue>();
+  bool joined_ = false;
+};
+
+// Relay over a WebSocket of its own.
+class WsPipe final : public RelayPipe {
+ public:
+  WsPipe(std::unique_ptr<Http> http, std::unique_ptr<WebSocket> ws) : http_(std::move(http)), ws_(std::move(ws)) {}
+  bool send(const uint8_t *p, size_t n) override { return ws_->send_binary(p, n); }
+  std::optional<std::string> receive() override {
+    for (;;) {
+      bool bin = false;
+      auto m = ws_->receive(&bin);
+      if (!m || bin) return m;  // text is the runtime's keepalive
+    }
+  }
+  void close() override { ws_->close(); }
+  const char *kind() const override { return "a relay connection"; }
+
+ private:
+  std::unique_ptr<Http> http_;
+  std::unique_ptr<WebSocket> ws_;
+};
 }  // namespace
 
 Listener::Listener(int id, Env env) : id_(id), env_(std::move(env)), created_us_(now_us()), history_(kHistory) {
@@ -108,7 +194,7 @@ void Listener::shutdown() {
     rq_stop_ = true;
   }
   rq_cv_.notify_all();
-  if (rws_) rws_->close();
+  if (pipe_) pipe_->close();
   if (relay_tx_thread_.joinable() && relay_tx_thread_.get_id() != std::this_thread::get_id()) relay_tx_thread_.join();
   if (relay_thread_.joinable() && relay_thread_.get_id() != std::this_thread::get_id()) relay_thread_.join();
   if (pc_ && !relay_) {
@@ -153,6 +239,7 @@ std::string Listener::create_offer(int gather_timeout_ms, const std::atomic<bool
     using S = rtc::PeerConnection::State;
     if (s == S::Connected) {
       self->disconnected_since_ = 0;
+      self->media_up_ = true;  // audio can flow now; the control channel opens a few round trips later
       LOGI("listener %d: connected", self->id_);
     } else if (s == S::Disconnected) {
       if (!self->disconnected_since_) self->disconnected_since_ = now_us();
@@ -254,7 +341,8 @@ bool Listener::set_answer(const std::string &sdp, std::string *err) {
   return true;
 }
 
-bool Listener::start_relay(const std::string &url, const std::vector<uint8_t> &key, std::string *err) {
+bool Listener::start_relay(const std::string &url, const std::vector<uint8_t> &key, std::string *err,
+                           std::weak_ptr<Rendezvous> rdv, const std::string &session) {
   // The WebRTC offer this listener was created for will not be used.
   if (pc_) {
     if (dc_) dc_->resetCallbacks();
@@ -264,17 +352,23 @@ bool Listener::start_relay(const std::string &url, const std::vector<uint8_t> &k
     try { pc_->close(); } catch (...) {}
   }
   relay_key_ = key;
-  relay_http_ = std::make_unique<Http>();
-  // Short attempts, several of them: some networks silently drop the first
-  // connection to one of Cloudflare's addresses (a 12 s stall here made the
-  // page give up). A fresh attempt usually lands at once.
-  std::string e;
   int64_t t0 = now_us();
-  for (int attempt = 1; attempt <= 5 && !rws_ && now_us() - t0 < 18000000; ++attempt) {
-    rws_ = relay_http_->websocket(url, 3000, &e);
-    if (!rws_) LOGD("listener %d: relay connect attempt %d: %s", id_, attempt, e.c_str());
+  // Preferred: the socket the host already keeps open to the server. Nothing
+  // to connect, so nothing to stall (on this network a new connection to
+  // Cloudflare sometimes hangs for seconds), and several round trips saved.
+  if (!session.empty()) {
+    auto mux = std::make_unique<MuxPipe>(rdv, session);
+    if (mux->open(1500)) pipe_ = std::move(mux);
   }
-  if (!rws_) {
+  // Otherwise a connection of its own: short attempts, several of them.
+  std::string e;
+  for (int attempt = 1; attempt <= 5 && !pipe_ && now_us() - t0 < 18000000; ++attempt) {
+    auto http = std::make_unique<Http>();
+    auto ws = http->websocket(url, 3000, &e);
+    if (ws) pipe_ = std::make_unique<WsPipe>(std::move(http), std::move(ws));
+    else LOGD("listener %d: relay connect attempt %d: %s", id_, attempt, e.c_str());
+  }
+  if (!pipe_) {
     if (err) *err = e;
     return false;
   }
@@ -286,12 +380,13 @@ bool Listener::start_relay(const std::string &url, const std::vector<uint8_t> &k
   relay_thread_ = std::thread([this] { relay_loop(); });
   relay_tx_thread_ = std::thread([this] { relay_tx_loop(); });
   notify_settings();  // repeated by the sender loop until the page answers
-  LOGI("listener %d: relaying through the server (their network cannot reach this one directly)", id_);
+  LOGI("listener %d: relaying through the server over %s, ready in %lld ms (their network cannot reach this one directly)",
+       id_, pipe_->kind(), (long long)((now_us() - t0) / 1000));
   return true;
 }
 
 void Listener::relay_send(uint8_t type, const uint8_t *p, size_t n) {
-  if (!rws_) return;
+  if (!pipe_) return;
   std::vector<uint8_t> plain(n + 1);
   plain[0] = type;
   if (n) memcpy(plain.data() + 1, p, n);
@@ -334,7 +429,7 @@ void Listener::relay_tx_loop() {
       relay_backlog_ms_ = rq_audio_ms_;
     }
     int64_t t0 = now_us();
-    if (!rws_->send_binary(m.data.data(), m.data.size())) {
+    if (!pipe_->send(m.data.data(), m.data.size())) {
       if (state_ != State::Closed) LOGI("listener %d: relay closed", id_);
       state_ = State::Closed;
       return;
@@ -390,10 +485,8 @@ Plan Listener::relay_plan() {
 
 void Listener::relay_loop() {
   while (true) {
-    bool bin = false;
-    auto msg = rws_->receive(&bin);
+    auto msg = pipe_->receive();
     if (!msg) break;
-    if (!bin) continue;  // runtime keepalive text
     auto plain = aead_open(relay_key_, reinterpret_cast<const uint8_t *>(msg->data()), msg->size());
     if (!plain || plain->empty()) continue;  // not from the listener who holds the key
     int64_t now = now_us();
@@ -455,7 +548,10 @@ void Listener::push(std::shared_ptr<const SourceBlock> b) {
   // page that greeted before we joined the relay would otherwise wait for us
   // while we wait for it.
   State s = state_;
-  if (s != State::Live && !(relay_ && s == State::Connecting)) return;
+  // Also before the control channel is open: on a slow link it takes two or
+  // three more round trips (SCTP, then the channel), seconds the listener
+  // would otherwise wait in silence.
+  if (s != State::Live && !(s == State::Connecting && (relay_ || media_up_))) return;
   std::lock_guard lk(qmu_);
   queue_.push_back(std::move(b));
   // A listener whose encoder cannot keep up must never back up the capture

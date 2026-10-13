@@ -75,6 +75,9 @@ export class AoiRoom {
   }
 
   get s() { return this.ctx.storage; }
+  relayHosts(session) {
+    return this.hosts().filter(h => ((h.deserializeAttachment() || {}).relays || []).includes(session));
+  }
   hosts() { return this.ctx.getWebSockets('host'); }
 
   // Any activity extends the room's life; only rewrite the alarm past half-life
@@ -233,9 +236,30 @@ export class AoiRoom {
       if (size > RELAY_MAX) return;
       const peer = `r${att.role === 'host' ? 'l' : 'h'}:${att.session}`;
       for (const p of this.ctx.getWebSockets(peer)) { try { p.send(msg); } catch { } }
+      // A host that relays over its own signalling socket (no second
+      // connection to open, which on some networks stalls) gets the
+      // listener's messages there, prefixed with the 16-character session.
+      if (att.role === 'listener' && typeof msg !== 'string') {
+        const muxed = this.relayHosts(att.session);
+        if (muxed.length) {
+          const out = new Uint8Array(16 + msg.byteLength);
+          out.set(new TextEncoder().encode(att.session), 0);
+          out.set(new Uint8Array(msg), 16);
+          for (const h of muxed) { try { h.send(out); } catch { } }
+        }
+      }
       return;
     }
-    if (typeof msg !== 'string' || msg.length > MAX_BODY) return;
+    // The host's signalling socket carrying relay traffic: [session][message].
+    if (typeof msg !== 'string') {
+      if (msg.byteLength <= 16 || msg.byteLength > RELAY_MAX + 16) return;
+      const session = new TextDecoder().decode(new Uint8Array(msg, 0, 16));
+      if (!(att.relays || []).includes(session)) return;
+      const body = msg.slice(16);
+      for (const p of this.ctx.getWebSockets(`rl:${session}`)) { try { p.send(body); } catch { } }
+      return;
+    }
+    if (msg.length > MAX_BODY) return;
     let m; try { m = JSON.parse(msg); } catch { return; }
     const { owner } = att;
     const reply = o => { try { ws.send(JSON.stringify(o)); } catch { } };
@@ -255,6 +279,15 @@ export class AoiRoom {
       if (old.size) await this.s.delete([...old.keys()]);
       await this.touch();
       return reply({ t: 'ok', rid: m.rid, expiresIn: TTL_SECONDS });
+    }
+    if (m.t === 'rj' && isSession(m.session)) {       // relay this session over this socket
+      const relays = (att.relays || []).filter(x => x !== m.session).concat(m.session).slice(-4);
+      ws.serializeAttachment({ ...att, relays });
+      return reply({ t: 'rj', session: m.session, ok: true });
+    }
+    if (m.t === 'rx' && isSession(m.session)) {       // stop relaying it
+      ws.serializeAttachment({ ...att, relays: (att.relays || []).filter(x => x !== m.session) });
+      return;
     }
     if (m.t === 'ack' && isSession(m.session)) {      // host consumed the pushed answer
       await this.s.delete(`ans:${m.session}`);
@@ -278,6 +311,12 @@ export class AoiRoom {
       // One side of a relay left: tell the other so it reconnects promptly.
       const peer = `r${att.role === 'host' ? 'l' : 'h'}:${att.session}`;
       for (const p of this.ctx.getWebSockets(peer)) { try { p.close(4001, 'peer left'); } catch { } }
+      if (att.role === 'listener')
+        for (const h of this.relayHosts(att.session)) {
+          try { h.send(JSON.stringify({ t: 'rc', session: att.session })); } catch { }
+          const a = h.deserializeAttachment() || {};
+          h.serializeAttachment({ ...a, relays: (a.relays || []).filter(x => x !== att.session) });
+        }
       return;
     }
     // Start the grace clock; joiners stop being handed this offer shortly.

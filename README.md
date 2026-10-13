@@ -208,12 +208,39 @@ pairs of NATs that will not talk to each other (a carrier-grade NAT on one side
 and a strict router on the other). The page switches to the **relay** by
 itself:
 
-- UDP blocked: a STUN probe, run alongside the first attempt, gets no answer.
-  The page goes straight to the relay: listening within about 1-5 s.
+- UDP blocked: a STUN probe, started together with the host lookup, gets no
+  answer (or gives up). The page goes straight to the relay with the offer it
+  already has. A probe that is merely slow (4 s on emulated slow 3G) is not
+  taken for a blocked network: the direct attempt goes ahead and falls back
+  by itself.
 - No path between two NATs: connectivity checks get no reply at all for 5 s.
 - Once a tab has needed the relay for a host, it uses it first next time.
-- The host connects to the relay in several short attempts (3 s each): some
-  networks silently drop the first connection to one Cloudflare address.
+- The host relays over the WebSocket it already keeps open to the server
+  (messages prefixed with the session), so a relayed join opens no new
+  connection on the host's side: ready in 1-5 ms instead of a TCP+TLS
+  handshake, which on a network that drops some new connections to
+  Cloudflare could stall for 20 s. Older servers: a connection of its own,
+  in several short attempts.
+- The host's server socket retries in 5 s attempts, 0.5-8 s apart (was 12 s
+  attempts, up to 30 s apart).
+
+### How fast a listener hears sound
+
+Measured with Chrome's network emulation and a 4x slower CPU (a cheap phone):
+
+| Listener's network | Before (1.0.9) | Now |
+|---|---|---|
+| UDP blocked (relay), "Slow 3G" (~2 s per request) | 13.9 s | 5.8 s |
+| UDP blocked (relay), "Fast 3G" (~0.6 s round trip) | - | 2.1 s |
+| Direct, "Fast 3G" | - | 7.9 s |
+
+What changed on the page: the host lookup, the connection-server list, the
+UDP probe, the answer's PBKDF2 key and the relay player are all started at
+once instead of one after another; the relay answer, the relay socket and the
+player load in parallel; and sound starts as soon as the media path is up,
+before the control channel (which needs two or three more round trips). The
+direct path's remaining time is ICE, DTLS and SCTP handshakes, a fixed number
+of round trips.
 
 How the relay works:
 

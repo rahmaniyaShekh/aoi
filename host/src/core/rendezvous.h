@@ -7,7 +7,9 @@
 #pragma once
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -41,6 +43,19 @@ class Rendezvous {
 
   std::vector<IceServerCfg> ice_servers(bool *turn = nullptr);
   bool socket_up() const { return ws_up_; }
+
+  // Relay over this socket (no second connection to open, which on some
+  // networks stalls for seconds). Messages for `session` arrive in on_msg on
+  // the socket thread; on_closed when the listener's side of the relay closes.
+  // relay_join returns false when the socket is down or the server does not
+  // confirm in time (an older server): use a connection of its own then.
+  struct RelaySub {
+    std::function<void(std::string &&)> on_msg;
+    std::function<void()> on_closed;
+  };
+  bool relay_join(const std::string &session, RelaySub sub, int timeout_ms);
+  bool relay_send(const std::string &session, const uint8_t *p, size_t n);  // false: socket down right now
+  void relay_leave(const std::string &session);
   std::string last_error() const { std::lock_guard lk(mu_); return last_error_; }
   const std::string &base() const { return base_; }
 
@@ -53,7 +68,9 @@ class Rendezvous {
   Http http_;
   std::thread thread_, keepalive_;
   std::atomic<bool> stop_{false}, ws_up_{false};
-  std::unique_ptr<WebSocket> ws_;
+  std::shared_ptr<WebSocket> ws_;
+  std::map<std::string, RelaySub> relays_;  // sessions relayed over this socket
+  std::set<std::string> relay_ok_;           // ... confirmed by the server
   mutable std::mutex mu_;
   std::condition_variable cv_;
   std::map<std::string, std::string> answers_;   // session -> sealed answer

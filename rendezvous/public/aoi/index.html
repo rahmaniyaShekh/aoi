@@ -233,7 +233,7 @@ const BASE = '/aoi';
 const ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
 const PREFIX = 'AOI1:', MAGIC = [0x41, 0x4f, 0x49, 0x31], FLAG_ENC = 1;
 const SALT_LEN = 16, IV_LEN = 12, TAG_LEN = 16, PBKDF2_ITER = 200000;
-const ATTEMPT_TIMEOUT = 25000, GATHER_TIMEOUT = 8000, NO_PUBLIC_MS = 4000;
+const ATTEMPT_TIMEOUT = 25000, GATHER_TIMEOUT = 8000, NO_PUBLIC_MS = 6000;
 const STORE = 'aoi.hosts', PREFS = 'aoi.prefs';   // aoi.* keys: never collide with the screen-share page on this origin
 
 const $ = id => document.getElementById(id);
@@ -259,11 +259,23 @@ async function deriveKey(pass, salt) {
   const m = await crypto.subtle.importKey('raw', new TextEncoder().encode(pass), 'PBKDF2', false, ['deriveKey']);
   return crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: PBKDF2_ITER, hash: 'SHA-256' }, m, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
 }
+// PBKDF2 is deliberately slow (up to a second on a cheap phone). The answer's
+// key does not depend on anything the host sends, so it is derived while the
+// page is still looking the host up, and used once.
+let answerKey = null;
+function prepareAnswerKey(code) {
+  const salt = crypto.getRandomValues(new Uint8Array(SALT_LEN));
+  answerKey = { code, salt, key: deriveKey(code, salt) };
+  answerKey.key.catch(() => { });
+}
 async function sealBlob(text, code) {
   const body = await deflateRaw(new TextEncoder().encode(text));
-  const salt = crypto.getRandomValues(new Uint8Array(SALT_LEN)), iv = crypto.getRandomValues(new Uint8Array(IV_LEN));
+  let salt, key;
+  if (answerKey && answerKey.code === code) { ({ salt, key } = answerKey); key = await key; answerKey = null; }
+  else { salt = crypto.getRandomValues(new Uint8Array(SALT_LEN)); key = await deriveKey(code, salt); }
+  prepareAnswerKey(code);  // the next attempt's, in the background
+  const iv = crypto.getRandomValues(new Uint8Array(IV_LEN));
   const head = concat(new Uint8Array(MAGIC), new Uint8Array([FLAG_ENC]), salt, iv);
-  const key = await deriveKey(code, salt);
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: head, tagLength: TAG_LEN * 8 }, key, body));
   return PREFIX + b64urlEncode(concat(head, ct));
 }
@@ -490,6 +502,19 @@ function start(code) {
 // One loop owns the whole lifecycle; every await re-checks the generation so
 // a superseded attempt can never touch the connection that replaced it.
 async function driver(code, known, gen) {
+  // Started together, not one after another (each is a round trip, 2 s on a
+  // slow mobile link): the answer's key, the relay worklet, the connection
+  // servers and, from those, whether this network lets UDP out at all.
+  prepareAnswerKey(code);
+  if (window.AudioWorkletNode && S.ctx && S.workletCtx !== S.ctx) {
+    S.workletCtx = S.ctx;
+    S.worklet = S.ctx.audioWorklet.addModule(`${BASE}/relay-worklet.js`);
+    S.worklet.catch(() => { S.worklet = null; S.workletCtx = null; });
+  }
+  // `udpBlocked` is only ever set by a finished check: a slow network (STUN
+  // answered after 4 s on emulated slow 3G) must not be mistaken for a closed one.
+  let udpBlocked = false;
+  iceServers().then(sv => probeUdp(sv)).then(ok => { udpBlocked = !ok; }).catch(() => { });
   const id = await roomIdFor(code);
   let everConnected = false, waitingSince = Date.now(), failedInARow = 0;
   // Once this tab has needed the relay for this host, go straight to it.
@@ -509,10 +534,24 @@ async function driver(code, known, gen) {
       continue;
     }
     const canRelay = (room.caps || []).includes('relay') && relaySupported();
+    // UDP blocked (the probe ran while the host was being looked up): the
+    // relay, with the offer already in hand.
+    if (canRelay && !useRelay && udpBlocked) {
+      useRelay = true;
+      sessionStorage.setItem('aoi.relay.' + code, '1');
+      status('Your network blocks direct audio. Connecting through the relay…');
+    }
     const viaRelay = useRelay && canRelay;
-    const outcome = viaRelay
+    let outcome = viaRelay
       ? await relayAttempt(id, code, room, gen, () => { everConnected = known = true; })
       : await attempt(id, code, room, gen, () => { everConnected = known = true; });
+    if (outcome === 'noudp' && gen === generation) {
+      // Found out only now: same offer, through the relay, no new lookup.
+      useRelay = true;
+      sessionStorage.setItem('aoi.relay.' + code, '1');
+      status('Your network blocks direct audio. Connecting through the relay…');
+      outcome = await relayAttempt(id, code, room, gen, () => { everConnected = known = true; });
+    }
     if (gen !== generation) return;
     if (outcome === 'badcode') return showJoin('That code is not right.');
     if (outcome === 'kicked') return showJoin('The host removed you.');
@@ -668,8 +707,10 @@ async function attempt(id, code, room, gen, onLive) {
     await gathering;
     if (gen !== generation) { pc.close(); return 'aborted'; }
     // UDP blocked: go straight to the relay instead of answering with an
-    // offer that can never connect (and waiting to find that out).
-    if (!(await udp)) { pc.close(); return 'noudp'; }
+    // offer that can never connect (and waiting to find that out). A check
+    // still running gets 2.5 s more; after that the direct attempt goes
+    // ahead and falls back to the relay by itself if nothing answers.
+    if ((await Promise.race([udp, sleep(2500).then(() => true)])) === false) { pc.close(); return 'noudp'; }
     if (gen !== generation) { pc.close(); return 'aborted'; }
     const answer = await sealBlob(pc.localDescription.sdp, code);
     const post = await fetch(`${BASE}/api/room/${id}/answer`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ answer, session: room.session }) });
@@ -693,7 +734,9 @@ async function attempt(id, code, room, gen, onLive) {
       try {
         const st = await (S.receiver ? S.receiver.getStats() : pc.getStats());
         st.forEach(r => { if (r.type === 'inbound-rtp' && r.kind === 'audio' && r.packetsReceived > 5) gotAudio = true; });
-        if (gotAudio) { status('Starting sound…'); if (S.dc && S.dc.readyState === 'open') done.resolve('connected'); }
+        // Sound first: the control channel (host name, levels) follows a few
+        // round trips later, which on a slow link is seconds.
+        if (gotAudio) done.resolve('connected');
       } catch { }
     }, 300);
     let why = await done.promise;
@@ -781,16 +824,27 @@ async function relayAttempt(id, code, room, gen, onLive) {
   const raw = crypto.getRandomValues(new Uint8Array(32));
   let answer;
   try { answer = await sealBlob(JSON.stringify({ relay: 1, key: b64urlEncode(raw) }), code); } catch { return 'failed'; }
-  const post = await fetch(`${BASE}/api/room/${id}/answer`, { method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ answer, session: room.session }) });
-  if (post.status === 409) return 'stale';
-  if (!post.ok) return 'failed';
-  if (gen !== generation) return 'aborted';
+  // Three things at once: post the answer, open our end of the relay (the
+  // server holds it until the host joins), load the player. On a slow link
+  // that is one round trip instead of three.
+  const ws = new WebSocket(`${location.origin.replace(/^http/, 'ws')}${BASE}/api/room/${id}/relay?session=${room.session}&role=listener`);
+  ws.binaryType = 'arraybuffer';
+  const early = [];
+  ws.onmessage = ev => { if (typeof ev.data !== 'string') early.push(ev.data); };
+  let ctx = S.ctx;
+  try { if (!ctx || ctx.state === 'closed') ctx = S.ctx = new (window.AudioContext || window.webkitAudioContext)(); ctx.resume(); } catch { }
+  if (!S.worklet || S.workletCtx !== ctx) { S.worklet = ctx.audioWorklet.addModule(`${BASE}/relay-worklet.js`); S.workletCtx = ctx; }
+  let post;
+  try {
+    [post] = await Promise.all([
+      fetch(`${BASE}/api/room/${id}/answer`, { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ answer, session: room.session }) }),
+      S.worklet]);
+  } catch { try { ws.close(); } catch { } S.worklet = null; return 'failed'; }
+  if (post.status === 409) { try { ws.close(); } catch { } return 'stale'; }
+  if (!post.ok || gen !== generation) { try { ws.close(); } catch { } return post.ok ? 'aborted' : 'failed'; }
 
   const key = await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['encrypt', 'decrypt']);
-  let ctx = S.ctx;
-  try { if (!ctx || ctx.state === 'closed') ctx = S.ctx = new (window.AudioContext || window.webkitAudioContext)(); await ctx.resume(); } catch { }
-  try { await ctx.audioWorklet.addModule(`${BASE}/relay-worklet.js`); } catch { return 'failed'; }
   const player = new AudioWorkletNode(ctx, 'aoi-player', { numberOfInputs: 0, outputChannelCount: [2],
     processorOptions: { inRate: 48000, targetMs: relayFloor() } });
   const dest = ctx.createMediaStreamDestination();
@@ -819,8 +873,6 @@ async function relayAttempt(id, code, room, gen, onLive) {
   R.decoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 });
   player.port.onmessage = e => { R.prevReport = R.report; R.report = e.data; };
 
-  const ws = new WebSocket(`${location.origin.replace(/^http/, 'ws')}${BASE}/api/room/${id}/relay?session=${room.session}&role=listener`);
-  ws.binaryType = 'arraybuffer';
   R.ws = ws;
   S.relay = R; S.pc = null; S.dc = null; S.hello = null; S.hostStat = null; S.last = null; S.sender = null;
   const handle = async data => {
@@ -876,13 +928,16 @@ async function relayAttempt(id, code, room, gen, onLive) {
   };
   // Decryption is async; chain it so frames are decoded in arrival order.
   ws.onmessage = ev => { if (typeof ev.data !== 'string') relayChain = relayChain.then(() => handle(ev.data)); };
+  for (const d of early.splice(0)) relayChain = relayChain.then(() => handle(d));
   ws.onclose = () => done.resolve(S.live ? 'dropped' : 'failed');
-  ws.onopen = () => {
-    // Say hello until audio arrives: the host may join the relay after us.
+  // Say hello until audio arrives: the host may join the relay after us.
+  const hello = () => {
     const hi = () => { sayName(); sendPrefs(); };
     hi();
     R.ready = setInterval(() => { if (gotPcm) clearInterval(R.ready); else hi(); }, 1000);
   };
+  if (ws.readyState === 1) hello(); else ws.onopen = hello;
+  if (ws.readyState > 1) done.resolve('failed');
 
   const timer = setTimeout(() => done.resolve('timeout'), ATTEMPT_TIMEOUT);
   const watch = setInterval(() => {

@@ -164,7 +164,7 @@ class Engine {
   int next_id_ = 1;
 
   std::string code_, owner_;
-  std::unique_ptr<Rendezvous> rdv_;
+  std::shared_ptr<Rendezvous> rdv_;  // shared: relayed listeners hold it weakly
   std::atomic<bool> stopping_{false};
   std::atomic<bool> running_{false}, rotate_{false}, cancel_wait_{false}, published_{false}, turn_{false};
   std::thread host_thread_, house_thread_;
