@@ -185,7 +185,7 @@ bool parse_twcc(const uint8_t *f, size_t n, std::vector<TwccResult> &out) {
   return true;
 }
 
-void parse_rtcp(const uint8_t *p, size_t n, uint32_t our, RtcpEvents &ev) {
+void parse_rtcp(const uint8_t *p, size_t n, uint32_t our, RtcpEvents &ev, uint32_t other) {
   size_t off = 0;
   while (off + 4 <= n) {
     const uint8_t *h = p + off;
@@ -211,12 +211,13 @@ void parse_rtcp(const uint8_t *p, size_t n, uint32_t our, RtcpEvents &ev) {
       case 205:
         if (blen >= 8) {
           uint32_t media = be32(body + 4);
-          if (fmt == 1 && media == our) {
+          if (fmt == 1 && (media == our || (other && media == other))) {
+            auto &list = media == our ? ev.nacks : ev.nacks_other;
             for (size_t q = 8; q + 4 <= blen; q += 4) {
               uint16_t pid = be16(body + q), blp = be16(body + q + 2);
-              ev.nacks.push_back(pid);
+              list.push_back(pid);
               for (int b = 0; b < 16; ++b)
-                if (blp & (1 << b)) ev.nacks.push_back(uint16_t(pid + b + 1));
+                if (blp & (1 << b)) list.push_back(uint16_t(pid + b + 1));
             }
           } else if (fmt == 15) {
             parse_twcc(body + 8, blen - 8, ev.twcc);

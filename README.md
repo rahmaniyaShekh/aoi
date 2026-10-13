@@ -23,7 +23,7 @@ Listeners go to **https://share.mdarif.online/aoi** and type the code, or open
 | Command | What it does |
 |---|---|
 | `aoi start` | Starts detached, waits until the code is live, prints code, link and QR. Running it again just shows the code. |
-| `aoi start --split` | Split mode: your voice in the left channel, this PC's sound in the right, never mixed on the way. Each listener sets both levels and keeps them apart (voice left ear, sound right ear) or mixes them. `aoi restart --split` switches a running host. |
+| `aoi start --split` | Split mode: this PC's sound and your voice go to each listener as two separate streams, never mixed on the way. The listener sets each one's level and where it plays (left ear, both, right ear). `aoi restart --split` switches a running host. |
 | `aoi status [-w]` | Listeners and live link numbers (`-w` refreshes every second, `--json` for scripts). |
 | `aoi code` | Shows the code, link and QR again. |
 | `aoi stop` / `aoi restart` | Graceful stop (listeners are told, the code is withdrawn) in about 1 s. Forced after 6 s if ever needed. |
@@ -87,6 +87,11 @@ The listener's voice is cleaned up on the host as well (noise suppression and
 auto level, per listener, about 4 dB above the host's own voice level) so it
 stays clear over the music playing on the same output.
 
+Bluetooth earbuds' own mics are a poor choice for talking: measured on CMF
+Buds 2a, the mic sent pure digital silence 96 % of the time and let speech
+through in bursts (choppy, "crackling" speech), at phone-call bandwidth.
+Leave the mic on automatic and keep the earbuds for listening.
+
 Automatic device choice: a USB or wired headset mic first, then a Bluetooth LE
 Audio headset, then Windows' default mic. A classic Bluetooth headset mic is
 used only when chosen (`aoi mic buds`) or when it is the only one, because
@@ -101,10 +106,15 @@ same headset as the mic, otherwise on Windows' default output.
   sliders, each with mute. The host applies them to that listener's own mix
   (see below), so they cost no bandwidth and cannot put voice and music out
   of sync. Nothing is ever lowered automatically: no ducking.
-- In **split mode** the same sliders work on the page itself, plus *Keep them
-  apart* (on: their voice in the left ear, their PC's sound in the right;
-  off: both in both ears). The PC's sound is mono in this mode, as its
-  channel carries one side each.
+- In **split mode** (`aoi start --split`) the host sends two streams: the PC's
+  sound exactly as captured (stereo, no auto level) and the host's voice
+  (its own speech encoder). Over WebRTC they are two tracks; over the relay
+  each message carries both for the same 40 ms, decoded by two decoders into
+  two buffers of equal depth. Nothing is mixed until the listener's page:
+  - *Sound* and *Voice*: level and mute each.
+  - *Sound plays in* / *Voice plays in*: Left, Both or Right. The sound in
+    both ears stays stereo; in one ear it is folded to mono there.
+  - *Apart* (voice left, sound right, the default) and *Together* presets.
 - **I'm using earphones** (on by default). The listener's mic opens raw: no
   echo cancellation, noise suppression or auto gain in the browser. Asking a
   phone for any of them puts it in "call mode", where its own voice
@@ -114,6 +124,9 @@ same headset as the mic, otherwise on Windows' default output.
   (it drops the earbuds to phone-call quality). Turned off for listening on a
   speaker: the browser's full processing, so the host hears no echo.
 - **Low delay / Balanced / Unbreakable** buffering, and **Data saver** (~48 kbps).
+- A listener's voice over the relay arrives in 80 ms bursts on a TCP path, so
+  the host holds at least 200 ms of it (a smaller buffer kept running dry:
+  choppy, nearly inaudible speech).
 - Remembers hosts that worked (rename or forget), deep links, reconnects on its
   own when the host restarts, waits for a free spot when two people are already
   listening, keeps the screen awake, lock-screen media controls.

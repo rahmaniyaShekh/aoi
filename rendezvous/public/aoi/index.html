@@ -129,6 +129,11 @@
   dialog .btns button{flex:1;min-height:2.75rem;border-radius:.5rem;border:1px solid var(--line);background:none}
   dialog .btns .yes{background:var(--accent);color:var(--on);border-color:var(--accent);font-weight:600}
   #tap{margin:.5rem 0 0}
+  .pos{display:grid;grid-template-columns:6.5rem 1fr;align-items:center;gap:.75rem;min-height:3.25rem}
+  .pos .nm{font-size:.9375rem}
+  .presets{display:grid;grid-template-columns:1fr 1fr;gap:.5rem}
+  .presets .plain{margin-top:.5rem;line-height:1.2;padding:.375rem}
+  .presets small{display:block;color:var(--muted);font-size:.6875rem}
 </style>
 </head>
 <body>
@@ -181,7 +186,11 @@
       <div class="row" id="rowVol"><div class="nm">Volume</div><input type="range" id="vol" min="0" max="100" value="100" aria-label="Volume"><button class="val" id="volVal" type="button">100%</button></div>
       <div class="row" id="rowMusic"><div class="nm" id="musicName">Music<small id="musicSub">their speaker</small></div><input type="range" id="music" min="-30" max="10" step="1" value="0" aria-label="Their speaker level"><button class="val" id="musicVal" type="button" title="Mute / unmute">0 dB</button></div>
       <div class="row" id="rowVoice"><div class="nm">Voice<small id="voiceSub">their mic</small></div><input type="range" id="voice" min="-30" max="10" step="1" value="0" aria-label="Their microphone level"><button class="val" id="voiceVal" type="button" title="Mute / unmute">0 dB</button></div>
-      <button class="check" id="apart" type="button" role="switch" aria-checked="true" hidden><span>Keep them apart<small>their voice in your left ear, their PC's sound in the right</small></span><span class="sw"></span></button>
+      <div id="splitPos" hidden>
+        <div class="pos"><div class="nm">Sound plays in</div><div class="seg" data-src="sound" role="group" aria-label="Where their PC's sound plays"><button type="button" data-p="left">Left</button><button type="button" data-p="both">Both</button><button type="button" data-p="right">Right</button></div></div>
+        <div class="pos"><div class="nm">Voice plays in</div><div class="seg" data-src="voice" role="group" aria-label="Where their voice plays"><button type="button" data-p="left">Left</button><button type="button" data-p="both">Both</button><button type="button" data-p="right">Right</button></div></div>
+        <div class="presets"><button type="button" class="plain" id="presetApart">Apart<small>voice left, sound right</small></button><button type="button" class="plain" id="presetTogether">Together<small>both in both ears</small></button></div>
+      </div>
     </section>
 
     <section class="group">
@@ -279,7 +288,7 @@ function rememberHost(code, name) {       // only ever called once audio actuall
   list.unshift({ code, name: (prev?.custom ? prev.name : (name || prev?.name || '')).trim(), custom: !!prev?.custom, at: Date.now() });
   saveJSON(STORE, list.slice(0, 12));
 }
-const defaults = { music_db: 0, voice_db: 0, music_mute: false, voice_mute: false, mode: 'balanced', saver: false, vol: 100, earphones: true, apart: true };
+const defaults = { music_db: 0, voice_db: 0, music_mute: false, voice_mute: false, mode: 'balanced', saver: false, vol: 100, earphones: true, pos_sound: 'right', pos_voice: 'left' };
 let prefs = Object.assign({}, defaults, loadJSON(PREFS, {}));
 const savePrefs = () => saveJSON(PREFS, prefs);
 
@@ -530,8 +539,17 @@ async function attempt(id, code, room, gen, onLive) {
   S.pc = pc; S.hello = null; S.hostStat = null; S.last = null; S.jbTarget = 0;
   let done = deferred(), gotAudio = false, byeReason = '';
 
+  S.vstream = null; S.vreceiver = null;
   pc.ontrack = ev => {
-    S.stream = ev.streams[0] || new MediaStream([ev.track]);
+    if (ev.transceiver?.mid === 'v') {
+      // Split mode: the host's voice, a stream of its own.
+      S.vstream = new MediaStream([ev.track]);
+      S.vreceiver = ev.receiver;
+      applyBuffer();
+      applySplit();
+      return;
+    }
+    S.stream = new MediaStream([ev.track]);
     S.receiver = ev.receiver;
     const p = $('player');
     p.srcObject = S.stream;
@@ -561,7 +579,8 @@ async function attempt(id, code, room, gen, onLive) {
 
   try {
     await pc.setRemoteDescription({ type: 'offer', sdp });
-    const tr = pc.getTransceivers()[0];
+    const trs = pc.getTransceivers();
+    const tr = trs.find(t => t.mid === '0') || trs[0];
     // Send-capable from the start with no track, so Talk later is a
     // replaceTrack and needs no renegotiation (there is no signalling left).
     if (tr) tr.direction = 'sendrecv';
@@ -647,13 +666,34 @@ function relaySend(type, payload) {
   });
 }
 
+// Split mode over the relay: the host's voice gets its own decoder and its
+// own jitter buffer, holding the same target as the sound's.
+function relayVoice(R, ctx) {
+  R.vplayer = new AudioWorkletNode(ctx, 'aoi-player', { numberOfInputs: 0, outputChannelCount: [2],
+    processorOptions: { inRate: 48000, targetMs: R.target } });
+  R.vdecoder = new AudioDecoder({
+    output: ad => {
+      try {
+        const l = new Float32Array(ad.numberOfFrames);
+        ad.copyTo(l, { planeIndex: 0, format: 'f32-planar' });
+        R.vplayer.port.postMessage({ type: 'pcm', l, r: null }, [l.buffer]);
+      } finally { ad.close(); }
+    },
+    error: () => { },
+  });
+  R.vdecoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 1 });
+  applySplit();
+}
+
 function relayClose() {
   const R = S.relay;
   if (!R) return;
-  if (S.split && S.split.src === R.player) splitClose();
+  if (S.split) splitClose();
   S.relay = null;
   try { R.ws.close(); } catch { }
   try { R.decoder.state !== 'closed' && R.decoder.close(); } catch { }
+  try { R.vdecoder && R.vdecoder.state !== 'closed' && R.vdecoder.close(); } catch { }
+  try { R.vplayer && R.vplayer.disconnect(); } catch { }
   try { R.player.disconnect(); } catch { }
   clearInterval(R.ready);
 }
@@ -714,7 +754,26 @@ async function relayAttempt(id, code, room, gen, onLive) {
     catch { return; }
     if (S.relay !== R) return;
     R.bytes += buf.length;
-    if (plain[0] === 1) {
+    if (plain[0] === 5) {
+      // Split mode: each frame is the PC's sound then the host's voice, for
+      // the same 40 ms. Each has its own decoder and player.
+      if (!R.vdecoder) relayVoice(R, ctx);
+      let off = 2;
+      for (let i = 0; i < plain[1] && off + 6 <= plain.length; i++) {
+        const ts = ((plain[off] << 24) | (plain[off + 1] << 16) | (plain[off + 2] << 8) | plain[off + 3]) >>> 0;
+        const len = (plain[off + 4] << 8) | plain[off + 5];
+        off += 6;
+        if (off + len + 2 > plain.length) break;
+        const tus = Math.round(ts * 1e6 / 48000);
+        try { R.decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: tus, data: plain.subarray(off, off + len) })); } catch { }
+        off += len;
+        const vlen = (plain[off] << 8) | plain[off + 1];
+        off += 2;
+        if (off + vlen > plain.length) break;
+        if (vlen) { try { R.vdecoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: tus, data: plain.subarray(off, off + vlen) })); } catch { } }
+        off += vlen;
+      }
+    } else if (plain[0] === 1) {
       let off = 2;
       for (let i = 0; i < plain[1] && off + 6 <= plain.length; i++) {
         const ts = ((plain[off] << 24) | (plain[off + 1] << 16) | (plain[off + 2] << 8) | plain[off + 3]) >>> 0;
@@ -799,7 +858,7 @@ function relayStats() {
   if (conceal > 0.002) { R.target = Math.min(3000, R.target + 150); R.cleanSince = Date.now(); }
   else if (Date.now() - R.cleanSince > 20000) { R.target = Math.max(floor, R.target - 20); R.cleanSince = Date.now() - 15000; }
   R.target = Math.max(R.target, floor);
-  if (R.target !== t0) R.player.port.postMessage({ type: 'target', ms: R.target });
+  if (R.target !== t0) for (const pl of [R.player, R.vplayer]) if (pl) pl.port.postMessage({ type: 'target', ms: R.target });
   send({ t: 'rx', buf: rep.fillMs, conceal, loss: 0, rtt: R.rtt, path: 'relay' });
   send({ t: 'ping', id: Date.now() });
   S.view = { kbps, rtt: R.rtt, loss: 0, concealFrac: conceal, buf: rep.fillMs, relay: true, fec: 0, nack: 0, jitter: 0,
@@ -815,56 +874,67 @@ function sendPrefs() {
 }
 
 // ============================================================================
-// Split mode (the host started with --split): their voice arrives in the left
-// channel and their PC's sound in the right, never mixed on the way. Here each
-// gets its own level, and they either stay apart (voice left ear, sound right
-// ear) or are mixed into both ears.
+// Split mode (the host started with --split): the host's PC sound and the
+// host's voice arrive as two separate streams (two WebRTC tracks, or two
+// decoders over the relay) and are only put together here: each with its own
+// level, mute and place (left ear, both, right ear).
 // ============================================================================
 function applySplit() {
   const on = !!S.hello?.split;
-  $('apart').hidden = !on;
+  $('splitPos').hidden = !on;
   $('musicName').firstChild.textContent = on ? 'Sound' : 'Music';
-  $('musicSub').textContent = on ? (prefs.apart ? "their PC's sound · right" : "their PC's sound") : 'their speaker';
-  if (!S.hello?.split || !S.ctx) return;
+  $('musicSub').textContent = on ? "their PC's sound" : 'their speaker';
+  if (!on || !S.ctx) return;
   const ctx = S.ctx;
   let X = S.split;
   if (!X) {
-    // The source: the decoded relay stream, or the WebRTC track (which Chrome
-    // only feeds to Web Audio while some element is playing it, muted here).
-    let src;
-    if (S.relay) { src = S.relay.player; try { src.disconnect(S.relay.dest); } catch { } }
-    else if (S.stream) {
-      S.sink = S.sink || new Audio();
-      S.sink.muted = true; S.sink.srcObject = S.stream; S.sink.play().catch(() => { });
-      src = ctx.createMediaStreamSource(S.stream);
+    let srcM, srcV;
+    if (S.relay) {
+      if (!S.relay.vplayer) return;  // the first voice frame creates it
+      srcM = S.relay.player; srcV = S.relay.vplayer;
+      try { srcM.disconnect(); } catch { }
+    } else if (S.stream && S.vstream) {
+      // Chrome feeds a remote track to Web Audio only while an element plays
+      // it: two muted ones do that; the mix plays through the main player.
+      for (const k of ['m', 'v']) {
+        const el = S['sink' + k] = S['sink' + k] || new Audio();
+        el.muted = true; el.srcObject = k === 'm' ? S.stream : S.vstream; el.play().catch(() => { });
+      }
+      srcM = ctx.createMediaStreamSource(S.stream); srcV = ctx.createMediaStreamSource(S.vstream);
     } else return;
-    X = S.split = { src, sp: ctx.createChannelSplitter(2), gv: ctx.createGain(), gm: ctx.createGain(),
-      mg: ctx.createChannelMerger(2), out: ctx.createMediaStreamDestination(), apart: null };
-    src.connect(X.sp);
-    X.sp.connect(X.gv, 0); X.sp.connect(X.gm, 1);
-    X.mg.connect(X.out);
-    if (S.analyser) { try { X.mg.connect(S.analyser); } catch { } }
+    const out = ctx.createMediaStreamDestination(), bus = ctx.createGain();
+    bus.connect(out);
+    if (S.analyser) bus.connect(S.analyser);
+    const lane = src => {
+      const g = ctx.createGain(), mono = ctx.createGain(), pan = ctx.createStereoPanner();
+      mono.channelCount = 1; mono.channelCountMode = 'explicit'; mono.channelInterpretation = 'speakers';
+      src.connect(g); mono.connect(pan); pan.connect(bus);
+      return { src, g, mono, pan, pos: null };
+    };
+    X = S.split = { out, bus, m: lane(srcM), v: lane(srcV) };
     const p = $('player');
-    p.srcObject = X.out.stream;
+    p.srcObject = out.stream;
     p.play().then(() => { $('tap').hidden = ctx.state === 'running'; }).catch(() => { $('tap').hidden = false; });
   }
-  const now = ctx.currentTime;
-  const db = v => Math.pow(10, v / 20);
-  const both = prefs.apart ? 1 : 0.7;  // mixed: -3 dB each so the sum stays clear of clipping
-  X.gv.gain.setTargetAtTime(prefs.voice_mute ? 0 : db(prefs.voice_db) * both, now, 0.02);
-  X.gm.gain.setTargetAtTime(prefs.music_mute ? 0 : db(prefs.music_db) * both, now, 0.02);
-  if (X.apart !== prefs.apart) {
-    X.gv.disconnect(); X.gm.disconnect();
-    if (prefs.apart) { X.gv.connect(X.mg, 0, 0); X.gm.connect(X.mg, 0, 1); }
-    else { for (const g of [X.gv, X.gm]) { g.connect(X.mg, 0, 0); g.connect(X.mg, 0, 1); } }
-    X.apart = prefs.apart;
+  const now = ctx.currentTime, db = v => Math.pow(10, v / 20);
+  X.m.g.gain.setTargetAtTime(prefs.music_mute ? 0 : db(prefs.music_db), now, 0.02);
+  X.v.g.gain.setTargetAtTime(prefs.voice_mute ? 0 : db(prefs.voice_db), now, 0.02);
+  for (const [k, L] of [['sound', X.m], ['voice', X.v]]) {
+    const pos = prefs['pos_' + k];
+    if (L.pos === pos) continue;
+    L.g.disconnect();
+    // The PC's sound in both ears stays stereo, as it is; one ear means
+    // folding it to mono there. The voice is mono either way.
+    if (pos === 'both' && k === 'sound') L.g.connect(X.bus);
+    else { L.g.connect(L.mono); L.pan.pan.value = pos === 'left' ? -1 : pos === 'right' ? 1 : 0; }
+    L.pos = pos;
   }
 }
 function splitClose() {
   const X = S.split;
   S.split = null;
-  if (X) { try { X.src.disconnect(); X.mg.disconnect(); } catch { } }
-  if (S.sink) { S.sink.srcObject = null; }
+  if (X) { for (const L of [X.m, X.v]) { try { L.src.disconnect(); L.g.disconnect(); L.pan.disconnect(); } catch { } } try { X.bus.disconnect(); } catch { } }
+  for (const k of ['sinkm', 'sinkv']) if (S[k]) S[k].srcObject = null;
 }
 
 // ============================================================================
@@ -903,11 +973,12 @@ function renderHost() {
 }
 
 function applyBuffer() {
-  const r = S.receiver;
-  if (!r) return;
   const ms = Math.round(S.jbTarget);
-  if ('jitterBufferTarget' in r) { try { r.jitterBufferTarget = ms; } catch { } }
-  else if ('playoutDelayHint' in r) { try { r.playoutDelayHint = ms / 1000; } catch { } }
+  for (const r of [S.receiver, S.vreceiver]) {  // both streams wait the same, so they stay together
+    if (!r) continue;
+    if ('jitterBufferTarget' in r) { try { r.jitterBufferTarget = ms; } catch { } }
+    else if ('playoutDelayHint' in r) { try { r.playoutDelayHint = ms / 1000; } catch { } }
+  }
 }
 
 // Buffer policy. "Low delay" lets the browser run as tight as it can.
@@ -935,7 +1006,7 @@ async function pollStats() {
   try {
     const st = await pc.getStats();
     st.forEach(r => {
-      if (r.type === 'inbound-rtp' && r.kind === 'audio') inb = r;
+      if (r.type === 'inbound-rtp' && r.kind === 'audio' && (!inb || r.trackIdentifier === S.receiver?.track?.id)) inb = r;
       if (r.type === 'transport' && r.selectedCandidatePairId) pair = st.get(r.selectedCandidatePairId);
     });
     if (!pair) st.forEach(r => { if (r.type === 'candidate-pair' && (r.nominated || r.selected) && r.state === 'succeeded') pair = r; });
@@ -1186,7 +1257,8 @@ function renderPrefs() {
   $('voice').value = prefs.voice_db; $('voiceVal').textContent = prefs.voice_mute ? 'muted' : fmtDb(prefs.voice_db);
   $('rowMusic').classList.toggle('dim', prefs.music_mute);
   if (!$('voice').disabled) $('rowVoice').classList.toggle('dim', prefs.voice_mute);
-  $('apart').setAttribute('aria-checked', String(prefs.apart));
+  for (const g of document.querySelectorAll('#splitPos .seg'))
+    for (const b of g.children) b.setAttribute('aria-pressed', String(b.dataset.p === prefs['pos_' + g.dataset.src]));
   $('ear').setAttribute('aria-checked', String(prefs.earphones));
   $('saver').setAttribute('aria-checked', String(prefs.saver));
   for (const b of $('mode').children) b.setAttribute('aria-pressed', String(b.dataset.m === prefs.mode));
@@ -1204,7 +1276,10 @@ $('music').oninput = e => { prefs.music_db = +e.target.value; prefs.music_mute =
 $('voice').oninput = e => { prefs.voice_db = +e.target.value; prefs.voice_mute = false; prefChanged(); };
 $('musicVal').onclick = () => { prefs.music_mute = !prefs.music_mute; prefChanged(); };
 $('voiceVal').onclick = () => { prefs.voice_mute = !prefs.voice_mute; prefChanged(); };
-$('apart').onclick = () => { prefs.apart = !prefs.apart; prefChanged(); };
+for (const g of document.querySelectorAll('#splitPos .seg'))
+  g.onclick = e => { const b = e.target.closest('button'); if (!b) return; prefs['pos_' + g.dataset.src] = b.dataset.p; prefChanged(); };
+$('presetApart').onclick = () => { prefs.pos_voice = 'left'; prefs.pos_sound = 'right'; prefChanged(); };
+$('presetTogether').onclick = () => { prefs.pos_voice = 'both'; prefs.pos_sound = 'both'; prefChanged(); };
 $('ear').onclick = async () => {
   prefs.earphones = !prefs.earphones; prefChanged();
   if (S.talkTrack) { endTalk(); await beginTalk(); }  // reopen the mic the new way
@@ -1213,7 +1288,7 @@ $('saver').onclick = () => { prefs.saver = !prefs.saver; prefChanged(); };
 $('mode').onclick = e => {
   const b = e.target.closest('button'); if (!b) return;
   prefs.mode = b.dataset.m; S.jbTarget = 0; prefChanged();
-  if (S.relay) { S.relay.target = relayFloor(); S.relay.player.port.postMessage({ type: 'target', ms: S.relay.target }); }
+  if (S.relay) { S.relay.target = relayFloor(); for (const pl of [S.relay.player, S.relay.vplayer]) if (pl) pl.port.postMessage({ type: 'target', ms: S.relay.target }); }
   else bufferPolicy(S.view?.rtt || 0, 0);
 };
 $('soundBtn').onclick = () => { const p = $('player'); p.muted = !p.muted; renderPrefs(); };

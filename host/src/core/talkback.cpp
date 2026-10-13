@@ -100,7 +100,8 @@ void TalkStream::push(const RtpPacketInfo &rtp, int64_t arrival) {
   // Bound memory: nothing more than 2 s ahead is worth keeping.
   while (pkts_.size() > 150) pkts_.erase(pkts_.begin());
 
-  target_ms_ = std::clamp(2.5 * jitter_peak_ms_ + last_frame_ * 1000.0 / kRate + 20.0 + underrun_boost_ms_, 40.0, 300.0);
+  target_ms_ = std::clamp(2.5 * jitter_peak_ms_ + last_frame_ * 1000.0 / kRate + 20.0 + underrun_boost_ms_,
+                          std::max(40.0, min_target_ms_), 400.0);
 }
 
 void TalkStream::on_sender_report(uint64_t ntp, int64_t arrival) {

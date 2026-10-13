@@ -36,6 +36,9 @@ class TalkStream {
   void mix_into(float *out, int n, float gain);
 
   bool active() const;              // audio received recently
+  // Over the relay the voice arrives in ~80 ms bursts on a TCP path: the
+  // buffer must hold more than one burst, whatever the per-packet jitter says.
+  void set_min_target_ms(double ms) { std::lock_guard lk(mu_); min_target_ms_ = ms; }
   bool report(ReportBlock &rb);     // RTCP receiver report for the talker's stream
   std::vector<uint16_t> take_nacks(int64_t now_us, double rtt_ms);
   uint32_t ssrc() const { return ssrc_; }
@@ -70,7 +73,7 @@ class TalkStream {
   int64_t last_transit_ = 0;
   bool have_transit_ = false;
   double jitter_peak_ms_ = 0;
-  double target_ms_ = 60, underrun_boost_ms_ = 0;
+  double target_ms_ = 60, underrun_boost_ms_ = 0, min_target_ms_ = 0;
   int64_t last_arrival_ = 0, last_decay_ = 0;
   uint64_t lost_ = 0, concealed_ = 0, fec_ = 0;
   float level_db_ = -90;

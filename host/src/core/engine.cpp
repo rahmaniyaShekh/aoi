@@ -155,6 +155,7 @@ void Engine::set_status(const std::string &s, const std::string &err) {
 void Engine::on_system(const float *x, int frames) {
   auto b = std::make_shared<SourceBlock>();
   memcpy(b->system.data(), x, sizeof(float) * size_t(frames) * 2);
+  if (settings_.split) memcpy(b->system_raw.data(), x, sizeof(float) * size_t(frames) * 2);  // before auto level
   level_.process(b->system.data(), frames);
   b->mic_on = mic_on_;
   if (b->mic_on) {

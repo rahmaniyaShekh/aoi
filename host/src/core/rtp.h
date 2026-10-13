@@ -64,13 +64,14 @@ struct TwccResult {
 struct RtcpEvents {
   std::vector<ReportBlock> reports;      // RR/SR blocks about our stream
   std::vector<uint16_t> nacks;           // sequence numbers asked for
+  std::vector<uint16_t> nacks_other;     // ... of our second stream (split mode's voice)
   std::vector<TwccResult> twcc;          // in feedback order
   std::optional<uint32_t> remb_bps;
   bool has_sr = false; uint32_t sr_ssrc = 0; uint64_t sr_ntp = 0;  // the peer's sender report
   int bye = 0;
 };
 bool is_rtcp(const uint8_t *p, size_t n);
-void parse_rtcp(const uint8_t *p, size_t n, uint32_t our_ssrc, RtcpEvents &ev);
+void parse_rtcp(const uint8_t *p, size_t n, uint32_t our_ssrc, RtcpEvents &ev, uint32_t other_ssrc = 0);
 bool parse_twcc(const uint8_t *fci, size_t n, std::vector<TwccResult> &out);
 
 std::vector<uint8_t> build_sr(uint32_t ssrc, uint64_t ntp, uint32_t rtp_ts, uint32_t packets, uint32_t octets);

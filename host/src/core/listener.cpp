@@ -16,6 +16,7 @@ namespace aoi {
 
 namespace {
 constexpr int kHistory = 1024;  // ~20 s of 20 ms packets, far more than any NACK needs
+constexpr uint8_t kPtVoice = 110;  // split mode's voice stream (its own m-line, its own payload type)
 
 // "turn:host:port?transport=udp" -> rtc::IceServer. libjuice relays over UDP
 // only, so TCP/TLS TURN URLs are skipped here (the browser still uses them).
@@ -59,6 +60,22 @@ Listener::Listener(int id, Env env) : id_(id), env_(std::move(env)), created_us_
     opus_encoder_ctl(enc_, OPUS_SET_DTX(0));
     opus_encoder_ctl(enc_, OPUS_SET_LSB_DEPTH(24));
   }
+  if (env_.split) {
+    venc_ = opus_encoder_create(kRate, 1, OPUS_APPLICATION_VOIP, &err);
+    if (venc_) {
+      opus_encoder_ctl(venc_, OPUS_SET_COMPLEXITY(10));
+      opus_encoder_ctl(venc_, OPUS_SET_VBR(1));
+      opus_encoder_ctl(venc_, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE));
+      opus_encoder_ctl(venc_, OPUS_SET_MAX_BANDWIDTH(OPUS_BANDWIDTH_FULLBAND));
+      opus_encoder_ctl(venc_, OPUS_SET_INBAND_FEC(1));  // a lost voice frame comes back from the next one
+      opus_encoder_ctl(venc_, OPUS_SET_DTX(0));
+    }
+    vssrc_ = (random_u32() | 1) ^ 0x10;
+    if (vssrc_ == ssrc_) vssrc_ ^= 0x20;
+    vseq_ = uint16_t(random_u32());
+    vrtp_ts_ = random_u32();
+    vhistory_.resize(kHistory);
+  }
   if (env_.sim.active())
     sim_ = std::make_unique<NetSim>(env_.sim, [this](std::vector<uint8_t> &&p) {
       auto t = track_;
@@ -72,6 +89,7 @@ Listener::Listener(int id, Env env) : id_(id), env_(std::move(env)), created_us_
 Listener::~Listener() {
   shutdown();
   if (enc_) opus_encoder_destroy(enc_);
+  if (venc_) opus_encoder_destroy(venc_);
 }
 
 // Called from the engine's own thread, never from a libdatachannel callback:
@@ -96,6 +114,7 @@ void Listener::shutdown() {
   if (pc_ && !relay_) {
     if (dc_) dc_->resetCallbacks();
     if (track_) track_->resetCallbacks();
+    if (vtrack_) vtrack_->resetCallbacks();
     pc_->resetCallbacks();
     int64_t t0 = now_us();
     try { pc_->close(); } catch (...) {}
@@ -156,6 +175,21 @@ std::string Listener::create_offer(int gather_timeout_ms, const std::atomic<bool
   track_ = pc_->addTrack(media);
   track_->onMessage([weak](rtc::binary msg) { if (auto s = weak.lock()) s->on_rtp_or_rtcp(msg); },
                     [](rtc::string) {});
+  if (env_.split) {
+    // The host's voice: a second track, send-only, mono speech.
+    rtc::Description::Audio v("v", rtc::Description::Direction::SendOnly);
+    v.addOpusCodec(kPtVoice, "minptime=10;useinbandfec=1;maxplaybackrate=48000");
+    if (auto *m = v.rtpMap(kPtVoice)) {
+      m->addFeedback("transport-cc");
+      m->addFeedback("nack");
+    }
+    v.addExtMap(rtc::Description::Entry::ExtMap(kExtTwcc,
+                "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01"));
+    v.addSSRC(vssrc_, std::string("aoi-v"), std::string("aoi-stream"), std::string("aoi-voice"));
+    vtrack_ = pc_->addTrack(v);
+    vtrack_->onMessage([weak](rtc::binary msg) { if (auto s = weak.lock()) s->on_rtp_or_rtcp(msg); },
+                       [](rtc::string) {});
+  }
 
   rtc::DataChannelInit init;  // reliable, ordered: control is tiny and must arrive
   dc_ = pc_->createDataChannel("ctl", init);
@@ -225,6 +259,7 @@ bool Listener::start_relay(const std::string &url, const std::vector<uint8_t> &k
   if (pc_) {
     if (dc_) dc_->resetCallbacks();
     if (track_) track_->resetCallbacks();
+    if (vtrack_) vtrack_->resetCallbacks();
     pc_->resetCallbacks();
     try { pc_->close(); } catch (...) {}
   }
@@ -247,6 +282,7 @@ bool Listener::start_relay(const std::string &url, const std::vector<uint8_t> &k
   last_ctl_us_ = now_us();
   relay_ = true;
   state_ = State::Connecting;
+  talk_.set_min_target_ms(200);  // the page sends 80 ms of voice per message, over TCP
   relay_thread_ = std::thread([this] { relay_loop(); });
   relay_tx_thread_ = std::thread([this] { relay_tx_loop(); });
   notify_settings();  // repeated by the sender loop until the page answers
@@ -259,7 +295,8 @@ void Listener::relay_send(uint8_t type, const uint8_t *p, size_t n) {
   std::vector<uint8_t> plain(n + 1);
   plain[0] = type;
   if (n) memcpy(plain.data() + 1, p, n);
-  RelayMsg m{type == 1, type == 1 ? relay_batch_ms_ : 0, aead_seal(relay_key_, plain.data(), plain.size())};
+  bool audio = type == 1 || type == 5;
+  RelayMsg m{audio, audio ? relay_batch_ms_ : 0, aead_seal(relay_key_, plain.data(), plain.size())};
   std::lock_guard lk(rq_mu_);
   if (rq_stop_) return;
   if (m.audio) {
@@ -308,18 +345,26 @@ void Listener::relay_tx_loop() {
 
 // ~80 ms of audio per message: few enough messages to sit comfortably inside
 // the free Workers quota, short enough to add little delay.
-void Listener::relay_frame(uint32_t ts, const uint8_t *p, size_t n, int frame_ms) {
+// Split mode (type 5): each frame carries the PC's sound and then the host's
+// voice for the same 40 ms: [ts][len][sound][len][voice].
+void Listener::relay_frame(uint32_t ts, const uint8_t *p, size_t n, int frame_ms, const uint8_t *v, size_t vn) {
   if (relay_batch_.empty()) relay_batch_.assign(1, 0);  // frame count, filled in on send
   uint8_t h[6];
   put_be32(h, ts);
   put_be16(h + 4, uint16_t(n));
   relay_batch_.insert(relay_batch_.end(), h, h + 6);
   relay_batch_.insert(relay_batch_.end(), p, p + n);
+  if (env_.split) {
+    uint8_t l[2];
+    put_be16(l, uint16_t(vn));
+    relay_batch_.insert(relay_batch_.end(), l, l + 2);
+    if (vn) relay_batch_.insert(relay_batch_.end(), v, v + vn);
+  }
   ++relay_batch_frames_;
   relay_batch_ms_ += frame_ms;
   if (relay_batch_ms_ >= 80 || relay_batch_frames_ >= 8) {
     relay_batch_[0] = uint8_t(relay_batch_frames_);
-    relay_send(1, relay_batch_.data(), relay_batch_.size());
+    relay_send(env_.split ? 5 : 1, relay_batch_.data(), relay_batch_.size());
     relay_batch_.clear();
     relay_batch_frames_ = relay_batch_ms_ = 0;
   }
@@ -474,6 +519,14 @@ void Listener::sender_loop() {
         sr = build_sr(ssrc_, ntp_now(), rtp_ts_, packets_, octets_);
       }
       send_packet(std::move(sr), false);
+      if (vtrack_) {
+        std::vector<uint8_t> vsr;
+        {
+          std::lock_guard lk(mu_);
+          vsr = build_sr(vssrc_, ntp_now(), vrtp_ts_, vpackets_, voctets_);
+        }
+        send_voice_packet(std::move(vsr));
+      }
     }
     // Return channel: receiver reports and NACKs for the listener's microphone.
     if (now - last_nack_us_ > 20000) {
@@ -505,20 +558,16 @@ void Listener::sender_loop() {
 
 void Listener::process_block(const SourceBlock &b) {
   if (env_.split) {
-    // Left: the host's voice. Right: the PC's sound folded to mono. Each has
-    // its own limiter, so a loud song can never pull the voice down; the
-    // listener sets both levels on their page.
-    float v[kBlock * 2], m[kBlock * 2], mix[kBlock * 2];
-    for (int i = 0; i < kBlock; ++i) {
-      float vi = b.mic_on ? b.voice[size_t(i)] : 0.f;
-      float mi = 0.5f * (b.system[2 * size_t(i)] + b.system[2 * size_t(i) + 1]);
-      v[2 * i] = v[2 * i + 1] = vi;
-      m[2 * i] = m[2 * i + 1] = mi;
-    }
-    split_voice_lim_.process(v, kBlock);
-    split_music_lim_.process(m, kBlock);
-    for (int i = 0; i < kBlock; ++i) { mix[2 * i] = v[2 * i]; mix[2 * i + 1] = m[2 * i]; }
-    pcm_.insert(pcm_.end(), mix, mix + kBlock * 2);
+    // Two streams, nothing mixed: the PC's sound exactly as captured (stereo,
+    // no auto level; only a limiter that does nothing below -1 dBFS), and
+    // the host's voice on its own. The listener's page sets both levels and
+    // where each one plays.
+    float m[kBlock * 2];
+    memcpy(m, b.system_raw.data(), sizeof m);
+    limiter_.process(m, kBlock);
+    pcm_.insert(pcm_.end(), m, m + kBlock * 2);
+    if (b.mic_on) vpcm_.insert(vpcm_.end(), b.voice.begin(), b.voice.end());
+    else vpcm_.insert(vpcm_.end(), size_t(kBlock), 0.f);
     int frame_samples = kRate / 1000 * (applied_.frame_ms ? applied_.frame_ms : 20);
     while (int(pcm_.size()) >= frame_samples * 2) encode_frame();
     return;
@@ -568,10 +617,17 @@ void Listener::encode_frame() {
     caps_.max_bps = std::min(prefs_.max_kbps, env_.host_max_kbps ? env_.host_max_kbps->load() : 256) * 1000;
     caps = caps_;
     plan = relay_ ? relay_plan() : cc_.update(caps, now_us());
+    if (env_.split) {
+      // Split mode: the voice stream takes its share first (24-48 kbps of
+      // speech is clear; it gets ~20 % of the link), the sound gets the rest.
+      int total = relay_ ? plan.opus_bps : plan.target_bps;
+      vbps_ = std::clamp(total / 5, 24000, 48000);
+      int rest = std::max(16000, total - vbps_ - (relay_ ? 0 : 20000));  // + the voice packets' headers
+      plan = relay_ ? plan : make_plan(rest, cc_.loss(), cc_.rtt_ms(), rx_buffer_ms_, rx_conceal_, caps, applied_, true);
+      if (relay_) plan.target_bps = plan.opus_bps = rest;
+      plan.stereo = true;
+    }
   }
-  // Split mode: the two channels are two different things; folding them to
-  // mono would mix them for good. Stereo at any rate.
-  if (env_.split) plan.stereo = true;
   // Frame duration only changes on a frame boundary: exactly here.
   int frame_ms = applied_.frame_ms ? applied_.frame_ms : 20;
   if (plan.opus_bps != applied_.opus_bps || plan.stereo != applied_.stereo || plan.fec != applied_.fec ||
@@ -585,6 +641,18 @@ void Listener::encode_frame() {
   pcm_.erase(pcm_.begin(), pcm_.begin() + n * 2);
   uint32_t ts = rtp_ts_;
   rtp_ts_ += uint32_t(n);
+  // Split mode: the voice for exactly the same span, from its own encoder.
+  uint8_t vout[1000];
+  opus_int32 vlen = 0;
+  uint32_t vts = vrtp_ts_;
+  if (env_.split && venc_ && int(vpcm_.size()) >= n) {
+    if (vbps_ != applied_vbps_) { opus_encoder_ctl(venc_, OPUS_SET_BITRATE(vbps_)); applied_vbps_ = vbps_; }
+    if (plan.loss_pct != vloss_) { opus_encoder_ctl(venc_, OPUS_SET_PACKET_LOSS_PERC(std::max(plan.loss_pct, 5))); vloss_ = plan.loss_pct; }
+    vlen = opus_encode_float(venc_, vpcm_.data(), n, vout, sizeof vout);
+    vpcm_.erase(vpcm_.begin(), vpcm_.begin() + n);
+    vrtp_ts_ += uint32_t(n);
+    if (vlen < 0) vlen = 0;
+  }
   if (len <= 0) return;
   if (relay_) {
     {
@@ -592,10 +660,10 @@ void Listener::encode_frame() {
       ++packets_;
       octets_ += uint32_t(len);
       int64_t now = now_us();
-      wire_log_.push_back({now, int(len) + 8});
+      wire_log_.push_back({now, int(len + vlen) + 8});
       while (!wire_log_.empty() && now - wire_log_.front().first > 2000000) wire_log_.pop_front();
     }
-    relay_frame(ts, out, size_t(len), frame_ms);
+    relay_frame(ts, out, size_t(len), frame_ms, vout, size_t(vlen));
     return;
   }
 
@@ -628,6 +696,42 @@ void Listener::encode_frame() {
     octets_ += uint32_t(len);
   }
   send_packet(std::move(pkt), true);
+  if (vlen > 0) {
+    std::vector<uint8_t> vpkt;
+    {
+      std::lock_guard lk(mu_);
+      uint16_t seq = vseq_++;
+      uint16_t tseq = twcc_seq_++;
+      vpkt = build_rtp(kPtVoice, seq, vts, vssrc_, vfirst_, tseq, vout, size_t(vlen));
+      vfirst_ = false;
+      Hist &h = vhistory_[seq % kHistory];
+      h.seq = seq;
+      h.sent_us = now_us();
+      h.resent_us = 0;
+      h.pkt = vpkt;
+      cc_.on_sent(tseq, h.sent_us, int(vpkt.size()) + 38);
+      ++vpackets_;
+      voctets_ += uint32_t(vlen);
+    }
+    send_voice_packet(std::move(vpkt));
+  }
+}
+
+void Listener::send_voice_packet(std::vector<uint8_t> &&pkt) {
+  auto t = vtrack_;
+  if (!t || !t->isOpen()) return;
+  {
+    std::lock_guard lk(mu_);
+    int64_t now = now_us();
+    wire_log_.push_back({now, int(pkt.size()) + 38});
+    while (!wire_log_.empty() && now - wire_log_.front().first > 2000000) wire_log_.pop_front();
+  }
+  if (sim_) { sim_->send(std::move(pkt)); return; }  // the simulator delivers on the main track; fine for tests
+  try {
+    t->send(reinterpret_cast<const std::byte *>(pkt.data()), pkt.size());
+  } catch (const std::exception &e) {
+    LOGD("listener %d send (voice): %s", id_, e.what());
+  }
 }
 
 void Listener::send_packet(std::vector<uint8_t> &&pkt, bool media) {
@@ -652,9 +756,20 @@ void Listener::on_rtp_or_rtcp(const rtc::binary &msg) {
   size_t n = msg.size();
   int64_t now = now_us();
   if (is_rtcp(p, n)) {
+    if (vtrack_) {
+      // With two tracks, a compound packet that names both of our SSRCs is
+      // handed to both: process it once (it arrives back to back).
+      uint64_t h = 1469598103934665603ull;
+      for (size_t i = 0; i < n; ++i) h = (h ^ p[i]) * 1099511628211ull;
+      h ^= uint64_t(n) << 56;
+      std::lock_guard lk(rtcp_mu_);
+      if (std::find(rtcp_seen_.begin(), rtcp_seen_.end(), h) != rtcp_seen_.end()) return;
+      rtcp_seen_.push_back(h);
+      while (rtcp_seen_.size() > 16) rtcp_seen_.pop_front();
+    }
     RtcpEvents ev;
-    parse_rtcp(p, n, ssrc_, ev);
-    std::vector<std::vector<uint8_t>> resend;
+    parse_rtcp(p, n, ssrc_, ev, vssrc_);
+    std::vector<std::vector<uint8_t>> resend, vresend;
     {
       std::lock_guard lk(mu_);
       for (auto &rb : ev.reports) {
@@ -691,9 +806,26 @@ void Listener::on_rtp_or_rtcp(const rtc::binary &msg) {
         resend.push_back(std::move(copy));
         ++retransmits_;
       }
+      for (uint16_t s : ev.nacks_other) {
+        if (vhistory_.empty()) break;
+        Hist &h = vhistory_[s % kHistory];
+        if (h.seq != s || h.pkt.empty()) continue;
+        if (now - h.sent_us > 1500000) continue;
+        if (h.resent_us && double(now - h.resent_us) / 1000.0 < rtt) continue;
+        if (resend_budget_ < double(h.pkt.size())) break;
+        resend_budget_ -= double(h.pkt.size());
+        h.resent_us = now;
+        std::vector<uint8_t> copy = h.pkt;
+        uint16_t tseq = twcc_seq_++;
+        set_twcc_seq(copy, tseq);
+        cc_.on_sent(tseq, now, int(copy.size()) + 38, true);
+        vresend.push_back(std::move(copy));
+        ++retransmits_;
+      }
     }
     if (ev.has_sr) talk_.on_sender_report(ev.sr_ntp, now);
     for (auto &r : resend) send_packet(std::move(r), true);
+    for (auto &r : vresend) send_voice_packet(std::move(r));
     return;
   }
   RtpPacketInfo rtp;

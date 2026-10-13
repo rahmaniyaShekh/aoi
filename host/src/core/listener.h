@@ -34,6 +34,7 @@ namespace aoi {
 // One 10 ms block of source audio, shared read-only by every listener.
 struct SourceBlock {
   std::array<float, kBlock * 2> system{};  // stereo, after auto-level
+  std::array<float, kBlock * 2> system_raw{};  // stereo, as captured (split mode sends it untouched)
   std::array<float, kBlock> voice{};       // host mic, conditioned (zeros when off)
   bool voice_active = false;
   bool mic_on = false;
@@ -110,6 +111,7 @@ class Listener : public std::enable_shared_from_this<Listener> {
   void process_block(const SourceBlock &b);
   void encode_frame();
   void send_packet(std::vector<uint8_t> &&pkt, bool media);
+  void send_voice_packet(std::vector<uint8_t> &&pkt);
   void on_rtp_or_rtcp(const rtc::binary &msg);
   void on_control(const std::string &text);
   void send_ctl(const std::string &json);
@@ -138,7 +140,6 @@ class Listener : public std::enable_shared_from_this<Listener> {
 
   // mixing + encoding (sender thread only)
   Limiter limiter_{-1.0f, 5.f, 150.f};
-  Limiter split_voice_lim_{-1.0f, 5.f, 150.f}, split_music_lim_{-1.0f, 5.f, 150.f};  // split mode: one per source
   float g_music_ = 1.f, g_voice_ = 1.f;
   std::vector<float> pcm_;  // pending interleaved stereo for the next frame
   OpusEncoder *enc_ = nullptr;
@@ -168,11 +169,29 @@ class Listener : public std::enable_shared_from_this<Listener> {
 
   TalkStream talk_;
 
+  // ---- split mode: the host's voice as a stream of its own ----
+  // Its own Opus encoder (speech mode, mono), RTP stream (own SSRC, sequence
+  // and timestamps, sharing the transport-wide sequence) and NACK history.
+  // Over WebRTC it is a second track; over the relay it rides in the same
+  // message as the PC's sound, frame by frame. Never mixed with the sound.
+  OpusEncoder *venc_ = nullptr;
+  std::shared_ptr<rtc::Track> vtrack_;
+  uint32_t vssrc_ = 0, vrtp_ts_ = 0, vpackets_ = 0, voctets_ = 0;
+  uint16_t vseq_ = 0;
+  bool vfirst_ = true;
+  int vbps_ = 32000, applied_vbps_ = 0, vloss_ = -1;
+  std::vector<float> vpcm_;   // pending mono voice, in step with pcm_
+  std::vector<Hist> vhistory_;
+  // A compound RTCP packet naming both of our SSRCs reaches both tracks:
+  // count it once.
+  std::mutex rtcp_mu_;
+  std::deque<uint64_t> rtcp_seen_;
+
   // ---- relay mode ----
   void relay_loop();
   void relay_tx_loop();
   void relay_send(uint8_t type, const uint8_t *p, size_t n);
-  void relay_frame(uint32_t ts, const uint8_t *p, size_t n, int frame_ms);
+  void relay_frame(uint32_t ts, const uint8_t *p, size_t n, int frame_ms, const uint8_t *v = nullptr, size_t vn = 0);
   Plan relay_plan();
   std::atomic<bool> relay_{false};
   std::vector<uint8_t> relay_key_;
