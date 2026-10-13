@@ -185,6 +185,11 @@
     </section>
 
     <section class="group">
+      <p class="gt">Your mic</p>
+      <button class="check" id="ear" type="button" role="switch" aria-checked="true"><span>I'm using earphones<small>Best sound while your mic is on. Turn off if you listen on a speaker, so they hear no echo.</small></span><span class="sw"></span></button>
+    </section>
+
+    <section class="group">
       <p class="gt">Connection</p>
       <div class="seg" id="mode" role="group" aria-label="Buffering">
         <button type="button" data-m="live" aria-pressed="false">Low delay<small>~0.1 s</small></button>
@@ -274,7 +279,7 @@ function rememberHost(code, name) {       // only ever called once audio actuall
   list.unshift({ code, name: (prev?.custom ? prev.name : (name || prev?.name || '')).trim(), custom: !!prev?.custom, at: Date.now() });
   saveJSON(STORE, list.slice(0, 12));
 }
-const defaults = { music_db: 0, voice_db: 0, music_mute: false, voice_mute: false, duck: true, mode: 'balanced', saver: false, vol: 100 };
+const defaults = { music_db: 0, voice_db: 0, music_mute: false, voice_mute: false, duck: true, mode: 'balanced', saver: false, vol: 100, earphones: true };
 let prefs = Object.assign({}, defaults, loadJSON(PREFS, {}));
 const savePrefs = () => saveJSON(PREFS, prefs);
 
@@ -955,12 +960,47 @@ function audioSession(type) {
   try { if (navigator.audioSession && navigator.audioSession.type !== type) navigator.audioSession.type = type; } catch { }
 }
 
+// The talk mic. With earphones (the default) there is no echo to cancel, and
+// the browser's echo canceller is what makes some systems switch playback to
+// "call" processing, duck it or route it differently while the mic is on: so
+// it is left off and the host's music stays at full quality. On a speaker it
+// is on, so the host does not hear their own audio come back.
+// A Bluetooth earbud's mic switches the earbuds to the hands-free profile:
+// everything they play drops to phone-call quality. When the device has
+// another mic (the laptop's or phone's own), that one is used instead.
+// Windows names a Bluetooth headset's mic "Headset (Name)"; a wired or USB
+// one is "Headset Microphone (...)" and is left alone.
+const BT_MIC = /bluetooth|hands-?free|airpods|buds|\bbt\b|^(default - )?headset \(/i;
+async function openTalkMic() {
+  const base = { echoCancellation: !prefs.earphones, noiseSuppression: true, autoGainControl: true, channelCount: 1 };
+  const other = async () => {
+    try {
+      const devs = await navigator.mediaDevices.enumerateDevices();
+      const ins = devs.filter(d => d.kind === 'audioinput' && d.label && !/^(default|communications)$/.test(d.deviceId));
+      return ins.find(d => !BT_MIC.test(d.label));
+    } catch { return null; }
+  };
+  let ms = await navigator.mediaDevices.getUserMedia({ audio: base });
+  const label = ms.getAudioTracks()[0]?.label || '';
+  if (BT_MIC.test(label)) {
+    const alt = await other();
+    if (alt) {
+      try {
+        const ms2 = await navigator.mediaDevices.getUserMedia({ audio: { ...base, deviceId: { exact: alt.deviceId } } });
+        ms.getTracks().forEach(t => t.stop());
+        ms = ms2;
+      } catch { }
+    }
+  }
+  return ms;
+}
+
 async function beginTalk() {
   audioSession('play-and-record');
   if (S.relay) return beginRelayTalk();
   if (!S.sender || S.talkTrack) return;
   try {
-    const ms = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 } });
+    const ms = await openTalkMic();
     if (!S.live) { ms.getTracks().forEach(t => t.stop()); return; }
     S.talkTrack = ms.getAudioTracks()[0];
     await S.sender.replaceTrack(S.talkTrack);
@@ -987,7 +1027,7 @@ async function beginRelayTalk() {
   try {
     const cfg = { codec: 'opus', sampleRate: rate, numberOfChannels: 1, bitrate: 32000 };
     if (!(await AudioEncoder.isConfigSupported(cfg)).supported) { $('micLbl').textContent = 'No mic on relay'; return; }
-    const ms = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 } });
+    const ms = await openTalkMic();
     if (!S.live || !S.relay) { ms.getTracks().forEach(t => t.stop()); return; }
     S.talkTrack = ms.getAudioTracks()[0];
     const batch = [];
@@ -1075,6 +1115,7 @@ function renderPrefs() {
   $('rowMusic').classList.toggle('dim', prefs.music_mute);
   if (!$('voice').disabled) $('rowVoice').classList.toggle('dim', prefs.voice_mute);
   $('duck').setAttribute('aria-checked', String(prefs.duck));
+  $('ear').setAttribute('aria-checked', String(prefs.earphones));
   $('saver').setAttribute('aria-checked', String(prefs.saver));
   for (const b of $('mode').children) b.setAttribute('aria-pressed', String(b.dataset.m === prefs.mode));
   const muted = $('player').muted;
@@ -1092,6 +1133,10 @@ $('voice').oninput = e => { prefs.voice_db = +e.target.value; prefs.voice_mute =
 $('musicVal').onclick = () => { prefs.music_mute = !prefs.music_mute; prefChanged(); };
 $('voiceVal').onclick = () => { prefs.voice_mute = !prefs.voice_mute; prefChanged(); };
 $('duck').onclick = () => { prefs.duck = !prefs.duck; prefChanged(); };
+$('ear').onclick = async () => {
+  prefs.earphones = !prefs.earphones; prefChanged();
+  if (S.talkTrack) { endTalk(); await beginTalk(); }  // reopen the mic the new way
+};
 $('saver').onclick = () => { prefs.saver = !prefs.saver; prefChanged(); };
 $('mode').onclick = e => {
   const b = e.target.closest('button'); if (!b) return;
