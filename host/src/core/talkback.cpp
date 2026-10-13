@@ -9,9 +9,27 @@
 
 namespace aoi {
 
-TalkStream::TalkStream() {
+TalkStream::TalkStream(bool clean_voice) {
   int err = 0;
   dec_ = opus_decoder_create(kRate, 1, &err);
+  if (!clean_voice) return;
+  VoiceOptions o;
+  o.aec = false;  // echo at the listener's end is their browser's job (it cancels when they use a speaker)
+  o.gentle_ns = true;
+  o.initial_gain_db = 6.f;
+  vp_ = std::make_unique<VoiceProcessor>(o);
+}
+
+void TalkStream::clean(const std::vector<float> &in) {
+  if (!vp_) { ring_.write(in.data(), int(in.size())); return; }
+  vp_acc_.insert(vp_acc_.end(), in.begin(), in.end());
+  size_t at = 0;
+  while (vp_acc_.size() - at >= size_t(VoiceProcessor::kFrames)) {
+    vp_->process(vp_acc_.data() + at);
+    ring_.write(vp_acc_.data() + at, VoiceProcessor::kFrames);
+    at += VoiceProcessor::kFrames;
+  }
+  vp_acc_.erase(vp_acc_.begin(), vp_acc_.begin() + long(at));
 }
 
 TalkStream::~TalkStream() {
@@ -136,6 +154,7 @@ void TalkStream::mix_into(float *out, int n, float gain) {
     conceal_run_ = 0;
     opus_decoder_ctl(dec_, OPUS_RESET_STATE);
     ring_.reset();
+    vp_acc_.clear();
   }
   // Total delay = undecoded packets + decoded samples waiting to play.
   double queued = pkts_.empty() ? 0.0 : double(pkts_.rbegin()->first + last_frame_ - next_ts_);
@@ -147,6 +166,7 @@ void TalkStream::mix_into(float *out, int n, float gain) {
     while (!pkts_.empty() && pkts_.begin()->first < keep_from) pkts_.erase(pkts_.begin());
     if (!pkts_.empty()) next_ts_ = pkts_.begin()->first;
     ring_.reset();
+    vp_acc_.clear();
     depth = target;
   }
   double err = (depth - target) / std::max(target, 1.0);
@@ -156,7 +176,7 @@ void TalkStream::mix_into(float *out, int n, float gain) {
   while (ring_.avail() < n * ratio + 4) {
     if (pkts_.empty() && conceal_run_ >= 3) break;  // talker went quiet: stop inventing audio
     decode_one(dec);
-    ring_.write(dec.data(), int(dec.size()));
+    clean(dec);
   }
   float tmp[4096];
   int total = 0;

@@ -30,6 +30,7 @@ struct VoiceOptions {
   // expander: an extra dip while the reference plays and nobody here talks;
   // off, because a missed syllable then takes the owner's voice down too.
   bool aec = true, ns = true, agc = true, expander = false;
+  bool gentle_ns = false;  // moderate noise suppression (a listener's voice, already compressed by Opus)
   float initial_gain_db = 22.f;  // where AGC2 starts (the last converged value for a known mic)
 };
 

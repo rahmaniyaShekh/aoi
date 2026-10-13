@@ -11,11 +11,13 @@
 #include <atomic>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <vector>
 
 #include "dsp.h"
 #include "rtp.h"
+#include "voice.h"
 
 struct OpusDecoder;
 
@@ -23,7 +25,7 @@ namespace aoi {
 
 class TalkStream {
  public:
-  TalkStream();
+  explicit TalkStream(bool clean_voice = true);  // false: the jitter buffer alone (selftest)
   ~TalkStream();
   TalkStream(const TalkStream &) = delete;
   TalkStream &operator=(const TalkStream &) = delete;
@@ -43,12 +45,18 @@ class TalkStream {
 
  private:
   void decode_one(std::vector<float> &out);
+  void clean(const std::vector<float> &in);  // decoded -> voice processing -> ring_
   int64_t unwrap_ts(uint32_t ts);
 
   mutable std::mutex mu_;
   OpusDecoder *dec_ = nullptr;
   std::map<int64_t, std::vector<uint8_t>> pkts_;  // extended timestamp -> opus frame
   FracRing ring_{kRate};
+  // The listener's mic arrives raw when they wear earphones (their browser
+  // does no processing, so their phone stays out of call mode and keeps the
+  // music clean): noise suppression and level are done here instead.
+  std::unique_ptr<VoiceProcessor> vp_;
+  std::vector<float> vp_acc_;
   bool playing_ = false, have_ts_ = false;
   int64_t last_ext_ts_ = 0, next_ts_ = 0;
   int last_frame_ = 960, conceal_run_ = 0;

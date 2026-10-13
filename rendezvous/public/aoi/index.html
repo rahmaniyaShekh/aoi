@@ -186,7 +186,7 @@
 
     <section class="group">
       <p class="gt">Your mic</p>
-      <button class="check" id="ear" type="button" role="switch" aria-checked="true"><span>I'm using earphones<small>Best sound while your mic is on. Turn off if you listen on a speaker, so they hear no echo.</small></span><span class="sw"></span></button>
+      <button class="check" id="ear" type="button" role="switch" aria-checked="true"><span>I'm using earphones<small>Your mic stays unprocessed, so their sound stays clean while you talk. Turn off if you listen on a speaker, so they hear no echo.</small></span><span class="sw"></span></button>
     </section>
 
     <section class="group">
@@ -960,11 +960,12 @@ function audioSession(type) {
   try { if (navigator.audioSession && navigator.audioSession.type !== type) navigator.audioSession.type = type; } catch { }
 }
 
-// The talk mic. With earphones (the default) there is no echo to cancel, and
-// the browser's echo canceller is what makes some systems switch playback to
-// "call" processing, duck it or route it differently while the mic is on: so
-// it is left off and the host's music stays at full quality. On a speaker it
-// is on, so the host does not hear their own audio come back.
+// The talk mic. With earphones (the default) it is opened raw: no echo
+// cancellation, noise suppression or auto gain. Asking a phone for any of them
+// puts it in "call mode", where its own voice processing treats the music as
+// noise and cancels or ducks it for as long as the mic is on. The host cleans
+// the voice up (noise suppression and level) after it arrives. On a speaker
+// all three are on, so the host does not hear their own audio come back.
 // A Bluetooth earbud's mic switches the earbuds to the hands-free profile:
 // everything they play drops to phone-call quality. When the device has
 // another mic (the laptop's or phone's own), that one is used instead.
@@ -972,7 +973,8 @@ function audioSession(type) {
 // one is "Headset Microphone (...)" and is left alone.
 const BT_MIC = /bluetooth|hands-?free|airpods|buds|\bbt\b|^(default - )?headset \(/i;
 async function openTalkMic() {
-  const base = { echoCancellation: !prefs.earphones, noiseSuppression: true, autoGainControl: true, channelCount: 1 };
+  const proc = !prefs.earphones;
+  const base = { echoCancellation: proc, noiseSuppression: proc, autoGainControl: proc, channelCount: 1 };
   const other = async () => {
     try {
       const devs = await navigator.mediaDevices.enumerateDevices();

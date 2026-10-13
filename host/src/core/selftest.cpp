@@ -199,7 +199,7 @@ void test_talkback() {
   opus_encoder_ctl(enc, OPUS_SET_BITRATE(32000));
   opus_encoder_ctl(enc, OPUS_SET_INBAND_FEC(1));
   opus_encoder_ctl(enc, OPUS_SET_PACKET_LOSS_PERC(15));
-  TalkStream ts;
+  TalkStream ts(false);  // the buffer alone: noise suppression would rightly remove this steady test tone
   std::mt19937 rng(3);
   std::uniform_real_distribution<double> u(0, 1);
   struct P { int64_t at; std::vector<uint8_t> pkt; };

@@ -117,7 +117,8 @@ VoiceProcessor::VoiceProcessor(VoiceOptions o) : impl_(std::make_unique<Impl>())
   c.echo_canceller.enabled = o.aec;
   c.echo_canceller.mobile_mode = false;
   c.noise_suppression.enabled = o.ns;
-  c.noise_suppression.level = webrtc::AudioProcessing::Config::NoiseSuppression::kHigh;
+  c.noise_suppression.level = o.gentle_ns ? webrtc::AudioProcessing::Config::NoiseSuppression::kModerate
+                                          : webrtc::AudioProcessing::Config::NoiseSuppression::kHigh;
   c.gain_controller2.enabled = o.agc;
   auto &ad = c.gain_controller2.adaptive_digital;
   ad.enabled = o.agc;

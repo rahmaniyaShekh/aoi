@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(AOI VERSION 1.0.5 LANGUAGES C CXX)
+project(AOI VERSION 1.0.6 LANGUAGES C CXX)
 
 # AOI host for Windows: one self-contained, statically linked console
 # executable. Dependencies are built from source into third_party/install

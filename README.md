@@ -92,11 +92,14 @@ same headset as the mic, otherwise on Windows' default output.
   sliders, each with mute, plus *Lower music while they talk*. The host
   applies them to that listener's own mix (see below), so they cost no
   bandwidth and cannot put voice and music out of sync.
-- **I'm using earphones** (on by default). While the listener's mic is on,
-  the browser's echo processing is skipped, so the host's music keeps full
-  quality, and a Bluetooth earbud mic is avoided when the device has another
-  (an earbud mic drops the earbuds to phone-call quality). Turned off for
-  listening on a speaker: echo cancellation on, so the host hears no echo.
+- **I'm using earphones** (on by default). The listener's mic opens raw: no
+  echo cancellation, noise suppression or auto gain in the browser. Asking a
+  phone for any of them puts it in "call mode", where its own voice
+  processing cancels or ducks the music for as long as the mic is on. The
+  host cleans the voice up instead (noise suppression and level, per
+  listener). A Bluetooth earbud mic is avoided when the device has another
+  (it drops the earbuds to phone-call quality). Turned off for listening on a
+  speaker: the browser's full processing, so the host hears no echo.
 - **Low delay / Balanced / Unbreakable** buffering, and **Data saver** (~48 kbps).
 - Remembers hosts that worked (rename or forget), deep links, reconnects on its
   own when the host restarts, waits for a free spot when two people are already
