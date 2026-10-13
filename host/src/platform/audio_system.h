@@ -1,5 +1,5 @@
-// The one audio interface the core uses. Windows implements it with WASAPI
-// (platform/win/audio_win.cpp); the macOS stub returns "not supported".
+// The one audio interface the core uses. This host implements it with WASAPI
+// (platform/win/audio_win.cpp).
 //
 // Every stream delivers or pulls 48 kHz float; the implementation converts
 // from whatever the device runs at (any rate, mono to multichannel, integer

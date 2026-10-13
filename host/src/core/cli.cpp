@@ -9,6 +9,7 @@
 #include <thread>
 
 #include "control.h"
+#include "devices.h"
 #include "engine.h"
 #include "platform/installer.h"
 #include "util.h"
@@ -82,10 +83,88 @@ void print_banner(const json &st) {
   outf("    %sCode%s   %s%s%s\n", C_DIM, C_RST, C_BOLD, st.value("pretty", "").c_str(), C_RST);
   outf("    %sLink%s   %s\n\n", C_DIM, C_RST, st.value("link", "").c_str());
   print_qr(st.value("link", ""));
+  const json &m = st.value("mic_dev", json::object());
+  if (st.value("mic", false) && m.value("present", false)) {
+    outf("\n    %sMic%s    %s  %s(%s)%s\n", C_DIM, C_RST, m.value("name", "").c_str(), C_DIM, m.value("reason", "").c_str(),
+         C_RST);
+    if (!m.value("error", "").empty()) outf("           %s%s%s\n", C_WARN, m.value("error", "").c_str(), C_RST);
+    if (!m.value("note", "").empty()) outf("           %s%s%s\n", C_ACC, m.value("note", "").c_str(), C_RST);
+  }
   outf("\n    Open the link on any phone or laptop, or enter the code at\n    %s\n\n",
        st.value("link", "").substr(0, st.value("link", "").rfind('/')).c_str());
   outf("    %saoi status%s  who is listening    %saoi stop%s  stop sharing    %saoi help%s  more\n\n", C_BOLD, C_RST,
        C_BOLD, C_RST, C_BOLD, C_RST);
+}
+
+std::string fmt_opt(const json &v, const char *fmt) {
+  if (!v.is_number()) return "-";
+  char b[32];
+  snprintf(b, sizeof b, fmt, v.get<double>());
+  return b;
+}
+
+// The microphone in a few lines: which, why, and anything the owner should
+// act on (privacy switch, a very low Windows input level, Bluetooth call mode).
+void print_mic_lines(const json &st, bool detail) {
+  const json &m = st.value("mic_dev", json::object());
+  const json &v = st.value("voice", json::object());
+  if (!st.value("mic", false)) {
+    outf("    %-10s off  %s(aoi mic on)%s\n", "Mic", C_DIM, C_RST);
+    return;
+  }
+  if (!m.value("present", false)) {
+    outf("    %-10s no microphone found\n", "Mic");
+    return;
+  }
+  outf("    %-10s %s  %s%s · %s%s%s\n", "Mic", m.value("name", "").c_str(), C_DIM, m.value("type", "").c_str(),
+       m.value("reason", "").c_str(), C_RST, st.value("mic_active", false) ? "  • speaking" : "");
+  std::string err = m.value("error", "");
+  if (!err.empty()) outf("    %-10s %s%s%s\n", "", m.value("access_denied", false) ? C_BAD : C_WARN, err.c_str(), C_RST);
+  if (st.contains("mic_volume") && st["mic_volume"].is_number()) {
+    double vol = st["mic_volume"].get<double>();
+    if (vol < 0.4)
+      outf("    %-10s %sWindows input level for this mic is %.0f%%: raise it in Settings → System → Sound → Input%s\n", "",
+           C_WARN, vol * 100, C_RST);
+  }
+  std::string note = m.value("note", "");
+  if (!note.empty()) outf("    %-10s %s%s%s\n", "", C_ACC, note.c_str(), C_RST);
+  if (v.empty()) return;  // the host is not running: nothing processed yet
+  if (!v.value("apm", false)) {
+    outf("    %-10s %sbasic voice chain (WebRTC processing not built in)%s\n", "", C_DIM, C_RST);
+    return;
+  }
+  std::string echo;
+  if (!v.value("aec", false)) echo = "echo cancel off";
+  else if (!v.value("reference_active", false)) echo = "echo cancel ready (nothing playing)";
+  else if (v.contains("measured_erle_db") && v["measured_erle_db"].is_number())
+    echo = "echo cancel on: speaker sound " + fmt_opt(v["measured_erle_db"], "-%.0f dB") + " (" +
+           fmt_opt(v["echo_out_dbfs"], "%.0f dBFS left") + ")";
+  else echo = "echo cancel on (measuring)";
+  outf("    %-10s %s%s · noise suppression · auto level %+.0f dB%s\n", "", C_DIM, echo.c_str(),
+       v.value("gain_db", 0.0), C_RST);
+  if (!detail) return;
+  outf("\n    %-14s %s, %d Hz, %d ch %s, %.0f ms buffer\n", "Device", m.value("running", false) ? "open" : "not open",
+       m.value("rate", 0), m.value("channels", 0), m.value("format", "").c_str(), m.value("latency_ms", 0.0));
+  outf("    %-14s %.1f dBFS now", "Level", st.value("mic_level_db", -90.0));
+  if (v.value("speech_s", 0.0) > 0)
+    outf(" · speech in %.0f dBFS → out %.0f dBFS (target -18)", v.value("in_speech_dbfs", -90.0),
+         v.value("out_speech_dbfs", -90.0));
+  outf("\n");
+  if (st.contains("mic_volume") && st["mic_volume"].is_number())
+    outf("    %-14s %.0f%% (Windows input level)\n", "Input volume", st["mic_volume"].get<double>() * 100);
+  std::string refs;
+  for (auto &r : st.value("echo_reference", json::array())) refs += (refs.empty() ? "" : " + ") + r.get<std::string>();
+  outf("    %-14s %s\n", "Echo reference", refs.empty() ? "none" : refs.c_str());
+  outf("    %-14s measured %s (mic %s → sent %s while only the speakers play)\n", "Echo removed",
+       fmt_opt(v.value("measured_erle_db", json()), "%.1f dB").c_str(), fmt_opt(v["echo_in_dbfs"], "%.0f dBFS").c_str(),
+       fmt_opt(v["echo_out_dbfs"], "%.0f dBFS").c_str());
+  outf("    %-14s AEC3 ERLE %s · echo path loss %s · delay %s · residual echo %s\n", "Echo canceller",
+       fmt_opt(v["erle_db"], "%.1f dB").c_str(), fmt_opt(v["erl_db"], "%.1f dB").c_str(),
+       fmt_opt(v["delay_ms"], "%.0f ms").c_str(), fmt_opt(v["residual_echo"], "%.2f").c_str());
+  outf("    %-14s %s (speech probability %.2f) · %.0f s of speech heard\n", "Voice activity",
+       v.value("voice", false) ? "speaking" : "quiet", v.value("speech_prob", 0.0), v.value("speech_s", 0.0));
+  outf("    %-14s %.0f µs average, %.0f µs worst per 10 ms block\n", "Processing", v.value("cpu_avg_us", 0.0),
+       v.value("cpu_max_us", 0.0));
 }
 
 void print_status(const json &st) {
@@ -98,14 +177,13 @@ void print_status(const json &st) {
   outf("\n    %-10s %s", "Sending", st.value("source", "").c_str());
   if (st.value("auto_level", false)) outf("  %s(level %+.1f dB)%s", C_DIM, st.value("gain_db", 0.0), C_RST);
   outf("\n");
-  if (st.value("mic", false)) {
-    std::string mn = st.value("mic_name", "");
-    outf("    %-10s %s%s\n", "Mic", mn.empty() ? "no microphone found" : mn.c_str(),
-         st.value("mic_active", false) ? "  • speaking" : "");
-  } else {
-    outf("    %-10s off\n", "Mic");
-  }
-  outf("    %-10s %s\n", "Talkback", st.value("talkback", false) ? ("on → " + st.value("talk_device", "")).c_str() : "off");
+  print_mic_lines(st, false);
+  const json &sp = st.value("speaker_dev", json::object());
+  if (st.value("talkback", false))
+    outf("    %-10s on → %s  %s(%s)%s\n", "Talkback", sp.value("name", "no output device").c_str(), C_DIM,
+         sp.value("reason", "").c_str(), C_RST);
+  else
+    outf("    %-10s off\n", "Talkback");
   outf("    %-10s up to %d kbps, adapts per listener%s\n", "Quality", st.value("max_kbps", 256),
        st.value("turn", false) ? " · relay available" : "");
   int live_n = 0;
@@ -400,6 +478,113 @@ int cmd_kick(int id) {
   return 0;
 }
 
+// ---- aoi mic / aoi speaker -------------------------------------------------------------
+namespace {
+
+void print_device_list(const json &list, bool mic, const std::string &in_use) {
+  if (list.empty()) {
+    outf("  No %s found.\n", mic ? "microphone" : "output device");
+    return;
+  }
+  outf("\n  %s%s%s\n", C_BOLD, mic ? "Microphones" : "Talkback outputs", C_RST);
+  for (auto &d : list) {
+    std::string flags;
+    if (d.value("default", false)) flags += " · Windows default";
+    if (d.value("comms", false)) flags += " · communications";
+    bool used = !in_use.empty() && d.value("id", "") == in_use;
+    outf("  %s%3d%s  %-44s %s%s%s%s%s\n", used ? C_OK : "", d.value("n", 0), used ? C_RST : "", d.value("name", "").c_str(),
+         C_DIM, d.value("type", "").c_str(), flags.c_str(), C_RST, used ? "   ← in use" : "");
+  }
+  outf("\n  %saoi %s <number|name part|auto>%s\n\n", C_DIM, mic ? "mic" : "speaker", C_RST);
+}
+
+int cmd_device(bool mic, const std::vector<std::string> &args) {
+  DeviceKind kind = mic ? DeviceKind::Capture : DeviceKind::Render;
+  std::string arg = args.empty() ? "" : args[0];
+  for (size_t i = 1; i < args.size(); ++i) if (args[i] != "--json") arg += " " + args[i];  // `aoi mic CMF Buds`
+  bool running = status_now().has_value();
+
+  if (arg.empty() || arg == "list" || arg == "ls") {
+    json captures, renders, st;
+    if (running) {
+      auto r = control_call({{"cmd", "devices"}}, 5000);
+      if (!r || !r->value("ok", false)) { out("AOI did not answer.\n"); return 1; }
+      captures = (*r)["captures"];
+      renders = (*r)["renders"];
+      st = (*r)["status"];
+    } else {
+      auto audio = create_audio_system();
+      auto caps = audio->list_devices(DeviceKind::Capture), rens = audio->list_devices(DeviceKind::Render);
+      captures = devices_json(caps);
+      renders = devices_json(rens);
+      DevicePrefs p = DevicePrefs::load();
+      DeviceChoice mc = choose_mic(caps, p), sc = choose_speaker(rens, mc.device, p);
+      auto view = [](const DeviceChoice &c) {
+        json j = {{"present", c.device.has_value()}, {"reason", c.reason}};
+        if (c.device) { j["id"] = c.device->id; j["name"] = c.device->name; j["type"] = device_type(*c.device); j["note"] = bluetooth_note(*c.device); }
+        return j;
+      };
+      st = {{"mic", p.mic_on}, {"mic_dev", view(mc)}, {"speaker_dev", view(sc)}, {"talkback", true}};
+    }
+    const json &cur = st.value(mic ? "mic_dev" : "speaker_dev", json::object());
+    if (arg.empty()) {
+      outf("\n");
+      if (mic) {
+        print_mic_lines(st, running);
+        if (!running) outf("\n    %sAOI is not running: this is what it will use at the next start.%s\n", C_DIM, C_RST);
+      } else {
+        outf("    %-10s %s  %s%s · %s%s\n", "Talkback", cur.value("name", "no output device").c_str(), C_DIM,
+             cur.value("type", "").c_str(), cur.value("reason", "").c_str(), C_RST);
+        if (!cur.value("error", "").empty()) outf("    %-10s %s%s%s\n", "", C_WARN, cur.value("error", "").c_str(), C_RST);
+        if (!running) outf("\n    %sAOI is not running: this is what it will use at the next start.%s\n", C_DIM, C_RST);
+      }
+      outf("\n    %saoi %s list%s  all devices    %saoi %s <n>%s  choose one    %saoi %s auto%s  automatic%s\n\n", C_BOLD,
+           mic ? "mic" : "speaker", C_RST, C_BOLD, mic ? "mic" : "speaker", C_RST, C_BOLD, mic ? "mic" : "speaker", C_RST,
+           mic ? "    aoi mic off/on" : "");
+      return 0;
+    }
+    if (std::find(args.begin(), args.end(), "--json") != args.end()) {
+      out((mic ? captures : renders).dump(2) + std::string(1, 10));
+      return 0;
+    }
+    print_device_list(mic ? captures : renders, mic, cur.value("id", ""));
+    return 0;
+  }
+
+  if (running) {
+    auto r = control_call({{"cmd", mic ? "mic" : "speaker"}, {"arg", arg}}, 5000);
+    if (!r) { out("AOI did not answer.\n"); return 1; }
+    std::string msg = r->value("message", "");
+    if (!r->value("ok", false)) { outf("  %s%s%s\n", C_WARN, msg.c_str(), C_RST); return 1; }
+    outf("  %s%s%s (live)\n", C_OK, msg.c_str(), C_RST);
+    // Show what the host settled on (a new device takes a moment to open).
+    nap_ms(1500);
+    if (auto st = status_now()) {
+      outf("\n");
+      if (mic) print_mic_lines(*st, false);
+      else {
+        const json &sp = st->value("speaker_dev", json::object());
+        outf("    %-10s %s  %s(%s)%s\n", "Talkback", sp.value("name", "").c_str(), C_DIM, sp.value("reason", "").c_str(), C_RST);
+      }
+      outf("\n");
+    }
+    return 0;
+  }
+  auto audio = create_audio_system();
+  auto list = audio->list_devices(kind);
+  DevicePrefs p = DevicePrefs::load();
+  std::string msg;
+  if (!apply_device_choice(p, kind, list, arg, &msg)) { outf("  %s%s%s\n", C_WARN, msg.c_str(), C_RST); return 1; }
+  if (!p.save()) { outf("  %sCould not save %s%s\n", C_BAD, narrow((data_dir() / "devices.json").wstring()).c_str(), C_RST); return 1; }
+  outf("  %s%s%s (saved; AOI is not running, so it takes effect at the next start)\n", C_OK, msg.c_str(), C_RST);
+  return 0;
+}
+
+}  // namespace
+
+int cmd_mic(const std::vector<std::string> &args) { return cmd_device(true, args); }
+int cmd_speaker(const std::vector<std::string> &args) { return cmd_device(false, args); }
+
 int cmd_install(bool start_after) {
   std::string err;
   bool was_running = status_now().has_value();
@@ -467,16 +652,19 @@ int cmd_help() {
       "    aoi logs [-f]         show (follow) the log\n"
       "    aoi new-code          new code; disconnects everyone on the old one\n"
       "    aoi kick <n>          remove listener #n\n"
+      "    aoi mic [list|<n>|<name>|laptop|auto|off|on]   which microphone (automatic by default)\n"
+      "    aoi speaker [list|<n>|<name>|laptop|auto]      where listeners' voices play\n"
       "\n"
       "    aoi update            install the latest release (uses the GitHub CLI)\n"
       "    aoi install           install for this user (PATH + Apps & features, no admin)\n"
       "    aoi uninstall [--purge]\n"
       "    aoi run               run in this terminal instead of the background\n"
-      "    aoi selftest          check codecs, networking maths and crypto on this PC\n"
+      "    aoi selftest          check codecs, voice processing, networking maths and crypto\n"
+      "    aoi echotest          play a voice and music for 35 s; measure the echo listeners would hear\n"
       "\n"
       "    Testing a bad network:  aoi start --simulate rate=48,loss=5,burst=3,delay=150,jitter=40\n\n"
-      "    Always on, nothing to configure: system audio + your microphone (if any),\n"
-      "    talkback, auto level, adaptive Opus up to 256 kbps stereo with loss protection.\n"
+      "    Always on, nothing to configure: system audio + your microphone (if any) with\n"
+      "    echo cancellation, talkback, auto level, adaptive Opus up to 256 kbps stereo.\n"
       "    Each listener sets their own music/voice balance on their page.\n"
       "    Listeners open the link in a browser - no app, no account. Up to 2 at a time.\n\n");
   return 0;
@@ -508,6 +696,8 @@ int aoi_main(const std::vector<std::string> &args) {
   if (cmd == "logs" || cmd == "log") return cmd_logs(flag("-f") || flag("--follow"));
   if (cmd == "new-code") return cmd_new_code();
   if (cmd == "kick") return cmd_kick(atoi(arg(0).c_str()));
+  if (cmd == "mic" || cmd == "mics") return cmd_mic(rest);
+  if (cmd == "speaker" || cmd == "speakers" || cmd == "output") return cmd_speaker(rest);
   if (cmd == "install") return cmd_install(!flag("--no-start"));
   if (cmd == "uninstall") return cmd_uninstall(flag("--purge"));
   if (cmd == "update" || cmd == "upgrade") {
@@ -516,6 +706,7 @@ int aoi_main(const std::vector<std::string> &args) {
     return cmd_update(from);
   }
   if (cmd == "selftest") return run_selftest(rest);
+  if (cmd == "echotest") return cmd_echotest(rest);
   if (cmd == "version" || cmd == "--version") { outf("aoi %s\n", AOI_VERSION); return 0; }
   if (cmd == "help" || cmd == "-h" || cmd == "--help") return cmd_help();
   outf("unknown command '%s'. Try: aoi help\n", cmd.c_str());

@@ -21,6 +21,7 @@
 #include <endpointvolume.h>
 #include <mmdeviceapi.h>
 #include <mmreg.h>
+#include <mmsystem.h>
 #include <ks.h>
 #include <ksmedia.h>
 
@@ -51,13 +52,16 @@ struct AOI_ACTIVATION_PARAMS {
 const PROPERTYKEY kPkeyFriendlyName = {{0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 14};
 const PROPERTYKEY kPkeyEnumeratorName = {{0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 24};
 const PROPERTYKEY kPkeyFormFactor = {{0x1da5d803, 0xd492, 0x4edd, {0x8c, 0x23, 0xe0, 0xc0, 0xff, 0xee, 0x7f, 0x0e}}, 0};
-const PROPERTYKEY kPkeyContainerId = {{0x8c7ed206, 0x3f8a, 0x4827, {0xb3, 0xab, 0xae, 0x9e, 0x1f, 0xaf, 0xc6, 0xc}}, 2};
+const PROPERTYKEY kPkeyContainerId = {{0x8c7ed206, 0x3f8a, 0x4827, {0xb3, 0xab, 0xae, 0x9e, 0x1f, 0xae, 0xfc, 0x6c}}, 2};
 // The endpoint's device instance path, and (for Bluetooth audio offloaded to
 // the chipset's DSP, where the enumerator says INTELAUDIO) the Bluetooth
 // device it belongs to; plus the kernel-streaming filter path.
 const PROPERTYKEY kPkeyDeviceInstance = {{0xb3f8fa53, 0x0004, 0x438e, {0x90, 0x03, 0x51, 0xa4, 0x6e, 0x13, 0x9b, 0xfc}}, 2};
 const PROPERTYKEY kPkeyDeviceRelated = {{0xb3f8fa53, 0x0004, 0x438e, {0x90, 0x03, 0x51, 0xa4, 0x6e, 0x13, 0x9b, 0xfc}}, 39};
 const PROPERTYKEY kPkeyKsFilterPath = {{0x233164c8, 0x1b2c, 0x4c7d, {0xbc, 0x68, 0xb6, 0x71, 0x68, 0x7a, 0x25, 0x67}}, 1};
+// PKEY_Devices_AudioDevice_RawProcessingSupported: the endpoint can deliver
+// its signal without the driver's (or an add-on suite's) effects.
+const PROPERTYKEY kPkeyRawSupported = {{0x8943b373, 0x388c, 0x4395, {0xb5, 0x57, 0xbc, 0x6d, 0xba, 0xff, 0xaf, 0xdb}}, 2};
 const GUID kIID_IAgileObject = {0x94ea2b94, 0xe9cc, 0x49e0, {0xc0, 0xff, 0xee, 0x64, 0xca, 0x8f, 0x5b, 0x90}};
 const GUID kSubtypeFloat = {0x00000003, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
 const GUID kSubtypePcm = {0x00000001, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
@@ -305,6 +309,33 @@ DeviceInfo describe(IMMDevice *dev, DeviceKind kind) {
     d.bus = DeviceBus::BuiltIn;
   }
   return d;
+}
+
+bool raw_supported(IMMDevice *dev) {
+  Com<IPropertyStore> ps;
+  if (FAILED(dev->OpenPropertyStore(STGM_READ, &ps))) return false;
+  PROPVARIANT v;
+  PropVariantInit(&v);
+  bool ok = SUCCEEDED(ps->GetValue(kPkeyRawSupported, &v)) && v.vt == VT_BOOL && v.boolVal;
+  PropVariantClear(&v);
+  return ok;
+}
+
+// A microphone in raw mode: no driver AGC, noise suppression, "voice
+// enhancement" or add-on effects suite (Nahimic, Waves, DTS...). Those are
+// non-linear and change their gain all the time, which an echo canceller
+// cannot follow; our own voice chain does the same jobs after it. Must be
+// set before Initialize. False (default mode) when the device has no raw path.
+bool request_raw(IAudioClient *client, IMMDevice *dev) {
+  if (!raw_supported(dev)) return false;
+  Com<IAudioClient2> c2;
+  if (FAILED(client->QueryInterface(__uuidof(IAudioClient2), reinterpret_cast<void **>(&c2)))) return false;
+  AudioClientProperties p{};
+  p.cbSize = sizeof p;
+  p.bIsOffload = FALSE;
+  p.eCategory = AudioCategory_Other;
+  p.Options = AUDCLNT_STREAMOPTIONS_RAW;
+  return SUCCEEDED(c2->SetClientProperties(&p));
 }
 
 HRESULT make_enumerator(Com<IMMDeviceEnumerator> &en) {
@@ -673,6 +704,14 @@ class WinCapture final : public AudioStream, StreamBase {
     notifier();
     int backoff = 300;
     const char *what = loopback_ ? "echo reference" : "microphone";
+    // Loopback cannot signal an event, so it is polled. With a 1 ms timer the
+    // reference reaches the echo canceller within ~3 ms of the engine mixing
+    // it, instead of up to a 15.6 ms default timer tick later.
+    struct FineTimer {
+      bool on;
+      explicit FineTimer(bool o) : on(o) { if (on) timeBeginPeriod(1); }
+      ~FineTimer() { if (on) timeEndPeriod(1); }
+    } timer(loopback_);
     std::string last_err;
     while (!stop_) {
       bool denied = false, missing = false;
@@ -685,8 +724,10 @@ class WinCapture final : public AudioStream, StreamBase {
       Fmt f;
       HANDLE ev = loopback_ ? nullptr : CreateEventW(nullptr, FALSE, FALSE, nullptr);
       int gen = loopback_ ? notifier().render_default_gen.load() : notifier().capture_default_gen.load();
+      bool raw = false;
       if (FAILED(hr = make_enumerator(en)) || FAILED(hr = open_device(en.p, id_, loopback_ ? eRender : eCapture, &dev)) ||
           FAILED(hr = dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void **>(&client))) ||
+          ((raw = !loopback_ && request_raw(client.p, dev.p)), false) ||
           FAILED(hr = client->GetMixFormat(&mix))) {
       } else if (!f.parse(mix)) {
         hr = AUDCLNT_E_UNSUPPORTED_FORMAT;
@@ -715,14 +756,16 @@ class WinCapture final : public AudioStream, StreamBase {
       client->GetStreamLatency(&lat);
       client->GetDevicePeriod(&period, nullptr);
       set_running(name, f, double(lat + period) / kHns);
-      LOGI("%s: %s, %d Hz %d ch %s", what, name.c_str(), f.rate, f.channels, f.describe().c_str());
+      if (raw) { std::lock_guard lk(mu_); st_.format += ", raw"; }
+      LOGI("%s: %s, %d Hz %d ch %s%s", what, name.c_str(), f.rate, f.channels, f.describe().c_str(),
+           raw ? ", raw (no driver effects)" : "");
       Resampler rs(1, f.rate, kRate);
       std::vector<float> mono, out, silence;
       int64_t last_data = now_us();
       std::atomic<int> &gen_now = loopback_ ? notifier().render_default_gen : notifier().capture_default_gen;
       while (!stop_ && (!id_.empty() || gen == gen_now)) {
         if (ev) WaitForSingleObject(ev, 50);
-        else Sleep(5);
+        else Sleep(2);
         UINT32 pending = 0;
         bool got = false;
         while (SUCCEEDED(hr = cap->GetNextPacketSize(&pending)) && pending > 0) {

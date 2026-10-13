@@ -6,9 +6,11 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
+#include "platform/audio_system.h"
 #include "platform/ipc.h"
 
 namespace aoi {
@@ -17,6 +19,8 @@ class Engine;
 struct Snapshot;
 
 nlohmann::json snapshot_json(const Snapshot &s);
+// A numbered device list, as `aoi mic list` prints it (numbers are 1-based).
+nlohmann::json devices_json(const std::vector<DeviceInfo> &list);
 
 class ControlServer {
  public:

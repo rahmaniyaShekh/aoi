@@ -167,6 +167,7 @@ class Listener : public std::enable_shared_from_this<Listener> {
 
   // ---- relay mode ----
   void relay_loop();
+  void relay_tx_loop();
   void relay_send(uint8_t type, const uint8_t *p, size_t n);
   void relay_frame(uint32_t ts, const uint8_t *p, size_t n, int frame_ms);
   Plan relay_plan();
@@ -174,11 +175,23 @@ class Listener : public std::enable_shared_from_this<Listener> {
   std::vector<uint8_t> relay_key_;
   std::unique_ptr<Http> relay_http_;
   std::unique_ptr<WebSocket> rws_;
-  std::thread relay_thread_;
+  std::thread relay_thread_, relay_tx_thread_;
+  // Sealed messages waiting for the socket. Sending blocks while TCP is
+  // full, so it has a thread of its own: the encoder never waits, stale
+  // audio is dropped instead of queued, and the backlog is the congestion
+  // signal for the relay bitrate.
+  struct RelayMsg { bool audio; int ms; std::vector<uint8_t> data; };
+  std::mutex rq_mu_;
+  std::condition_variable rq_cv_;
+  std::deque<RelayMsg> rq_;
+  int rq_audio_ms_ = 0;
+  bool rq_stop_ = false;
+  std::atomic<int> relay_backlog_ms_{0};
+  std::atomic<uint64_t> relay_dropped_ms_{0};
   std::vector<uint8_t> relay_batch_;
   int relay_batch_frames_ = 0, relay_batch_ms_ = 0;
-  std::atomic<int> relay_kbps_{96};
-  int64_t relay_adapt_us_ = 0, relay_clean_since_ = 0;
+  std::atomic<int> relay_kbps_{64};
+  int64_t relay_adapt_us_ = 0, relay_clean_since_ = 0, relay_cut_us_ = 0;
   Ewma relay_send_ms_;
   uint16_t relay_talk_seq_ = 0;
   std::atomic<bool> relay_heard_{false};

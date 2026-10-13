@@ -18,26 +18,35 @@
 #include "crypto.h"
 #include "dsp.h"
 #include "platform/audio_system.h"
+#include "devices.h"
 #include "rtp.h"
+#include "selftest.h"
 #include "talkback.h"
 #include "util.h"
 
 namespace aoi {
 
-namespace {
+namespace st {
 int g_fail = 0, g_pass = 0;
-bool g_trace = false;
 
-void check(bool ok, const char *name, const std::string &detail = {}) {
+void check(bool ok, const char *name, const std::string &detail) {
   (ok ? g_pass : g_fail)++;
   outf("  %s%s%s  %-52s %s%s%s\n", ok ? C_OK : C_BAD, ok ? "PASS" : "FAIL", C_RST, name, C_DIM, detail.c_str(), C_RST);
 }
 
-std::string f1(const char *fmt, double a, double b = 0, double c = 0, double d = 0) {
-  char buf[160];
+std::string f1(const char *fmt, double a, double b, double c, double d) {
+  char buf[200];
   snprintf(buf, sizeof buf, fmt, a, b, c, d);
   return buf;
 }
+}  // namespace st
+
+namespace {
+using st::check;
+using st::f1;
+using st::g_fail;
+using st::g_pass;
+bool g_trace = false;
 
 // ---------------------------------------------------------------------------------------
 void test_crypto() {
@@ -335,11 +344,17 @@ void test_devices() {
   }
   std::atomic<int> mic_frames{0};
   {
-    auto mic = audio->open_mic("", [&](const float *, int n) { mic_frames += n; });
+    DeviceChoice c = choose_mic(audio->list_devices(DeviceKind::Capture), DevicePrefs::load());
+    if (!c.device) {
+      check(true, "no microphone (music only; that is fine)");
+      return;
+    }
+    auto mic = audio->open_mic(c.device->id, [&](const float *, int n) { mic_frames += n; });
     std::this_thread::sleep_for(std::chrono::milliseconds(1500));
     bool ok = mic_frames > kRate / 2;
-    check(true, ok ? "microphone delivers audio" : "no microphone (music only; that is fine)",
-          ok ? mic->status().device_name : std::string());
+    StreamStatus ms = mic->status();
+    check(true, ok ? "microphone delivers audio" : "microphone did not deliver (music only)",
+          c.device->name + " (" + c.reason + ")" + (ok ? f1(", %.0f Hz %.0f ch", ms.rate, ms.channels) : ": " + ms.error));
   }
 }
 
@@ -365,7 +380,13 @@ int run_selftest(const std::vector<std::string> &args) {
   test_dsp();
   test_talkback();
   test_cc();
-  if (!quick) test_devices();
+  st::test_voice();
+  st::test_policy();
+  st::test_boundary();
+  if (!quick) {
+    if (g_trace) { g_verbose = true; log_init(data_dir() / "selftest.log", true); }
+    test_devices();
+  }
   outf("\n  %s%d passed%s, %s%d failed%s\n\n", C_OK, g_pass, C_RST, g_fail ? C_BAD : C_DIM, g_fail, C_RST);
   return g_fail ? 1 : 0;
 }

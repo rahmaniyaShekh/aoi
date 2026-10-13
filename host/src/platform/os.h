@@ -1,6 +1,6 @@
 // Operating-system services the core needs: clocks, paths, randomness,
-// processes, the console. Interface only; one implementation per platform
-// (platform/win, platform/mac). Core code reaches the OS through this file,
+// processes, the console. Interface only; implemented in platform/win.
+// Core code reaches the OS through this file,
 // audio_system.h, http.h, ipc.h and installer.h, and nothing else.
 #pragma once
 #include <cstdint>

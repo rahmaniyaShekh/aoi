@@ -1,11 +1,14 @@
-# platform/mac: compile-gated stub
+# mac: the macOS host (not started)
 
-AOI ships for Windows only. This directory implements the same platform
-interfaces (`../os.h`, `../audio_system.h`, `../http.h`, `../ipc.h`,
-`../installer.h`) so the core builds on macOS (`if(APPLE)` in
-`host/CMakeLists.txt`). Everything that needs real OS work returns
-"not supported on macOS yet". The POSIX parts (`os_mac.cpp`: clocks, paths,
-randomness, processes, console) already work.
+AOI ships for Windows only. The Windows host lives in `host/` and builds
+nothing from this folder. A macOS host will be its own project here, with its
+own build, so Windows and macOS code never mix.
+
+What is here is an early sketch kept for reference: stubs of the interfaces
+the Windows host's core uses (`host/src/platform/*.h`). Everything that needs
+real OS work returns "not supported on macOS yet"; the POSIX parts
+(`os_mac.cpp`: clocks, paths, randomness, processes, console) work. It is not
+compiled anywhere.
 
 A real port would use:
 

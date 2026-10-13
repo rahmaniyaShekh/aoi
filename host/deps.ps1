@@ -4,7 +4,7 @@
 #   powershell -ExecutionPolicy Bypass -File host\build.ps1
 #
 # Needs MSYS2 at C:\msys64 with:  pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-openssl mingw-w64-x86_64-zlib
-# CMake and Ninja are downloaded (portable) into .tools. Versions are pinned.
+# and Python 3 (for Meson). CMake, Ninja and Meson are fetched (portable) into .tools. Versions are pinned.
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $tp = Join-Path $root 'third_party'
@@ -54,4 +54,35 @@ cmake -S "$tp\libdatachannel" -B "$tp\build-dc" @common -DBUILD_SHARED_LIBS=OFF 
   -DOPENSSL_USE_STATIC_LIBS=TRUE -DOPENSSL_ROOT_DIR=C:/msys64/mingw64 | Out-Null
 cmake --build "$tp\build-dc"; cmake --install "$tp\build-dc" | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'dependency build failed' }
+
+# WebRTC Audio Processing (freedesktop webrtc-audio-processing v2.1, BSD-3:
+# AEC3, noise suppression, AGC2), static, with Meson (pinned, run from
+# .tools) and its abseil-cpp 20240722.0 subproject. The abseil tarball and the
+# wrap patch are fetched here (Python's own TLS may lack this machine's
+# certificates); meson verifies both against the hashes in the wrap file.
+Get-Source 'webrtc-apm' 'https://gitlab.freedesktop.org/pulseaudio/webrtc-audio-processing.git' 'v2.1'
+$mesonDir = Join-Path $tools 'meson-1.6.1'
+if (-not (Test-Path "$mesonDir\mesonbuild")) {
+  python -m pip install -q --target $mesonDir meson==1.6.1
+  if ($LASTEXITCODE -ne 0) { throw 'could not install meson' }
+}
+$cache = "$tp\webrtc-apm\subprojects\packagecache"
+New-Item -ItemType Directory -Force $cache | Out-Null
+$absl = @{
+  'abseil-cpp-20240722.0.tar.gz' = 'https://github.com/abseil/abseil-cpp/releases/download/20240722.0/abseil-cpp-20240722.0.tar.gz'
+  'abseil-cpp_20240722.0-3_patch.zip' = 'https://wrapdb.mesonbuild.com/v2/abseil-cpp_20240722.0-3/get_patch'
+}
+foreach ($f in $absl.Keys) { if (-not (Test-Path "$cache\$f")) { Invoke-WebRequest -UseBasicParsing $absl[$f] -OutFile "$cache\$f" } }
+$env:PYTHONPATH = $mesonDir
+$env:CC = 'gcc'; $env:CXX = 'g++'
+if (-not (Test-Path "$tp\build-apm\build.ninja")) {
+  python -m mesonbuild.mesonmain setup "$tp\build-apm" "$tp\webrtc-apm" --buildtype=release -Db_ndebug=true `
+    --default-library=static --prefer-static "--prefix=$prefix" --libdir=lib -Dcpp_std=c++17 | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw 'webrtc-audio-processing configure failed' }
+}
+ninja -C "$tp\build-apm" | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'webrtc-audio-processing build failed' }
+python -m mesonbuild.mesonmain install -C "$tp\build-apm" --quiet | Out-Null
+# abseil is a subproject: meson does not install its static archives.
+Copy-Item "$tp\build-apm\subprojects\abseil-cpp-20240722.0\*.a" "$tp\install\lib\" -Force
 "dependencies ready in $prefix"

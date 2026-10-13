@@ -29,14 +29,53 @@ Listeners go to **https://share.mdarif.online/aoi** and type the code, or open
 | `aoi logs [-f]` | The log (`%LOCALAPPDATA%\AOI\aoi.log`). |
 | `aoi new-code` | New code; everyone on the old code is disconnected. |
 | `aoi kick <n>` | Removes listener #n. |
+| `aoi mic [list\|<n>\|<name>\|laptop\|auto\|off]` | Which microphone. Automatic by default (see below); a choice is remembered. |
+| `aoi speaker [list\|<n>\|<name>\|laptop\|auto]` | Where listeners' voices play. Automatic by default. |
 | `aoi run` | Runs in the terminal instead of the background; Ctrl+C stops. |
 | `aoi install` / `aoi uninstall [--purge]` | Per-user install: `%LOCALAPPDATA%\Programs\AOI`, user PATH, Apps & features entry. Never starts at sign-in. |
-| `aoi selftest` | 27 checks on this PC: crypto, packet formats, DSP, jitter buffer, congestion control, live devices. |
+| `aoi selftest` | 41 checks on this PC: crypto, packet formats, DSP, voice processing, device choice, jitter buffer, congestion control, live devices. |
+| `aoi echotest` | Plays a voice and music through this PC's speakers for 35 s and reports how much echo the mic would send to listeners. Stop AOI first. |
 
 There are no settings. Defaults are fixed for the best result: system audio
-plus microphone (if there is one), talkback on, auto level on, adaptive
-Opus up to 256 kbps stereo, full loss protection, at most 2 listeners. Each
-listener sets their own balance on their page.
+plus microphone (if there is one) with echo cancellation, talkback on, auto
+level on, adaptive Opus up to 256 kbps stereo, full loss protection, at most 2
+listeners. Each listener sets their own balance on their page.
+
+## No echo: the host's voice chain
+
+A laptop's microphone hears its own speakers: the music, and the listeners'
+voices coming back (talkback). Sent on as they are, listeners hear themselves
+a moment later and the music twice. AOI removes it on the host, per 10 ms,
+with WebRTC's audio processing (the same AEC3 echo canceller, noise
+suppression and gain control Chrome uses):
+
+- **The microphone is opened raw** when the device allows it (most do): no
+  driver AGC, noise gate or add-on suite (Nahimic, Waves, DTS...). Those change
+  their gain all the time, which no echo canceller can follow; AOI does the
+  same jobs itself after the canceller.
+- **The echo reference is what the speakers actually play**: the output
+  device's loopback, after every app, our talkback and the device's own
+  effects are mixed. One signal, one delay to the mic.
+- **The mic is held back 40 ms** inside the canceller. Windows hands over the
+  loopback only after mixing a period, and a raw laptop mic can deliver the
+  echo of that period sooner; the canceller must see the sound before its
+  echo.
+- **Voice activity** (for ducking and "talking") comes from an RNN voice
+  detector on the cleaned signal, with a level floor: music, keys, a fan or
+  the faint remains of a listener's voice cannot trigger it.
+
+Measured on a Realtek + Intel Smart Sound laptop with Nahimic, speakers at
+normal volume (`aoi echotest`): echo reduced by 31-46 dB, leaving it at
+-50 to -65 dBFS, below the room's own noise. Before (1.0.3: no canceller,
+level-based voice detection) music from the speakers counted as "talking": the
+clean music was ducked 8 dB while a boosted, room-delayed copy of it, and of
+the listener's own voice, went out through the mic.
+
+Automatic device choice: a USB or wired headset mic first, then a Bluetooth LE
+Audio headset, then Windows' default mic. A classic Bluetooth headset mic is
+used only when chosen (`aoi mic buds`) or when it is the only one, because
+opening it switches the headset to call quality. Listeners' voices play on the
+same headset as the mic, otherwise on Windows' default output.
 
 ## The listener page
 
@@ -72,9 +111,9 @@ concealed dropped packets. Over the internet each of those becomes a weakness.
 
 Kept from ASOW because they were right: process-loopback capture excluding our
 own process tree (no driver compressor in the path, Bluetooth-proof, and
-talkback on one device without echo), the mic chain (high-pass, noise-floor gate,
-speech-only AGC, ducking), and drift-correcting fractional readers for the
-second clock (mic, talkback).
+talkback never sent back to listeners through the capture), ducking, and
+drift-correcting fractional readers for the second clock (mic, talkback). The
+mic chain is now WebRTC's (see above).
 
 ## Measured
 
@@ -101,19 +140,29 @@ can run on the same PC at once.
 
 ## When two networks cannot reach each other: the relay
 
-Most listeners connect directly, peer to peer. When *both* sides sit behind
-NATs that will not talk to each other (for example a carrier-grade NAT on one
-side and a strict router on the other), the page notices within about seven
-seconds (connectivity checks with no reply at all) and switches to the
-**relay**, automatically:
+Most listeners connect directly, peer to peer. Two kinds of networks cannot:
+ones that block UDP altogether (schools, offices, some mobile carriers), and
+pairs of NATs that will not talk to each other (a carrier-grade NAT on one side
+and a strict router on the other). The page switches to the **relay** by
+itself:
+
+- UDP blocked: a STUN probe, run alongside the first attempt, gets no answer.
+  The page goes straight to the relay: listening within about 1-5 s.
+- No path between two NATs: connectivity checks get no reply at all for 5 s.
+- Once a tab has needed the relay for a host, it uses it first next time.
+
+How the relay works:
 
 - The page puts a fresh AES-256 key inside its code-sealed answer. The host
   opens it, and both connect a WebSocket to the AOI Worker, which pairs them by
   the handshake session and forwards the messages. Every message is AES-GCM
   encrypted end to end; the server relays ciphertext it cannot read.
 - The host sends Opus in ~80 ms batches (40 ms frames, no redundancy: the
-  path is TCP, nothing is lost) and adapts the bitrate (16–192 kbps) to the
-  page's underruns and to how long its sends take. The page decodes with the
+  path is TCP, nothing is lost). Sending has its own thread and queue, so a
+  slow link never stalls the encoder: more than 0.4 s of waiting audio is
+  dropped (late audio is useless) and the bitrate falls at once. It adapts
+  16-192 kbps to the page's underruns, the send queue and send times,
+  starting at 64 kbps and climbing by a quarter every 5 clean seconds. The page decodes with the
   browser's built-in Opus decoder and plays through a small adaptive jitter
   buffer (`relay-worklet.js`). Talkback works the same way in reverse.
 - It runs on the **free Workers plan**: about 12 messages a second per relayed
@@ -132,16 +181,23 @@ candidates and many of these pairs connect through TURN instead.
 
 ```
 host/                 the Windows host (C++20, one static exe, no runtime dependencies)
-  src/audio.*         WASAPI: process loopback, endpoint fallback, mic, talkback output
-  src/dsp.*           loudness, auto level, look-ahead limiter, voice chain, drift reader
-  src/listener.*      one peer: mix, Opus encoder, RTP/RED/NACK, control channel
-  src/cc.*            congestion control + encoding plan
-  src/rtp.*           RTP/RTCP/RED/NACK/TWCC by hand
-  src/talkback.*      the return channel's jitter buffer (FEC, PLC, drift servo)
-  src/rendezvous.*    signalling client (hibernating WebSocket, HTTP fallback)
-  src/crypto.*        codes + sealed blob (AES-256-GCM, PBKDF2, raw deflate)
-  src/netsim.*        bottleneck/loss/jitter simulator for testing
-  src/cli.* control.* commands, detached daemon, named-pipe control
+  src/core/           platform-neutral algorithms; no OS calls (checked on every build)
+    engine.*          capture -> condition -> fan out; devices followed live
+    voice.*           WebRTC APM: AEC3 echo canceller, noise suppression, AGC2, voice detector
+    devices.*         which mic / talkback output, and why
+    dsp.*             loudness, auto level, look-ahead limiter, drift reader
+    listener.*        one peer: mix, Opus encoder, RTP/RED/NACK, control channel, relay
+    cc.*              congestion control + encoding plan
+    rtp.*             RTP/RTCP/RED/NACK/TWCC by hand
+    talkback.*        the return channel's jitter buffer (FEC, PLC, drift servo)
+    rendezvous.*      signalling client (hibernating WebSocket, HTTP fallback)
+    crypto.*          codes + sealed blob (AES-256-GCM, PBKDF2, raw deflate)
+    netsim.*          bottleneck/loss/jitter simulator for testing
+    cli.* control.*   commands, detached daemon, control channel
+    selftest*.cpp echotest.cpp
+  src/platform/*.h    the interfaces core uses to reach the OS
+  src/platform/win/   WASAPI (process loopback, raw mic, loopback reference), WinHTTP, named pipes, installer
+mac/                  the macOS host: a separate project (not started; nothing here is built)
 rendezvous/           Cloudflare Worker + Durable Object + listener page
   public/aoi/         the listener page + relay-worklet.js (the installer is a GitHub release, not served here)
   test/               contract tests (run against local or production)
@@ -152,8 +208,8 @@ third_party/          dependency sources, fetched by host/deps.ps1 (not committe
 ## Building and deploying
 
 ```powershell
-# once: MSYS2 at C:\msys64 with mingw-w64-x86_64-gcc, -openssl and -zlib
-powershell -ExecutionPolicy Bypass -File host\deps.ps1       # pinned opus, libdatachannel, speexdsp, qrcodegen
+# once: MSYS2 at C:\msys64 with mingw-w64-x86_64-gcc, -openssl and -zlib, and Python 3
+powershell -ExecutionPolicy Bypass -File host\deps.ps1       # pinned opus, libdatachannel, speexdsp, qrcodegen, webrtc-audio-processing
 powershell -ExecutionPolicy Bypass -File host\build.ps1      # -> dist\aoi.exe
 dist\aoi.exe selftest
 

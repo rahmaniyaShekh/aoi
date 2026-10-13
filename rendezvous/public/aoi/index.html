@@ -215,7 +215,7 @@ const BASE = '/aoi';
 const ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
 const PREFIX = 'AOI1:', MAGIC = [0x41, 0x4f, 0x49, 0x31], FLAG_ENC = 1;
 const SALT_LEN = 16, IV_LEN = 12, TAG_LEN = 16, PBKDF2_ITER = 200000;
-const ATTEMPT_TIMEOUT = 25000, GATHER_TIMEOUT = 8000;
+const ATTEMPT_TIMEOUT = 25000, GATHER_TIMEOUT = 8000, NO_PUBLIC_MS = 4000;
 const STORE = 'aoi.hosts', PREFS = 'aoi.prefs';   // aoi.* keys: never collide with the screen-share page on this origin
 
 const $ = id => document.getElementById(id);
@@ -418,6 +418,12 @@ async function driver(code, known, gen) {
     if (outcome === 'badcode') return showJoin('That code is not right.');
     if (outcome === 'kicked') return showJoin('The host removed you.');
     if (outcome === 'newcode') { saveJSON(STORE, loadSaved().filter(e => e.code !== code)); return showJoin('The host changed their code. Ask them for the new one.'); }
+    if (outcome === 'noudp') {
+      useRelay = true;
+      sessionStorage.setItem('aoi.relay.' + code, '1');
+      status('Your network blocks direct audio. Connecting through the relay…');
+      continue;
+    }
     $('listen').hidden = true; $('join').hidden = false; joining(true);
     // The host answered but no audio path formed: say so instead of an
     // endless "Connecting…", and keep trying (networks change, relays appear).
@@ -440,14 +446,47 @@ async function driver(code, known, gen) {
   }
 }
 
+// Non-trickle: the answer must carry the candidates. Resolves when gathering
+// completes, one second after the first public (server-reflexive or relay)
+// candidate, or at the timeout.
 function gatherComplete(pc, ms) {
-  if (pc.iceGatheringState === 'complete') return Promise.resolve();
   return new Promise(res => {
+    let grace = 0;
     const t = setTimeout(done, ms);
-    function done() { clearTimeout(t); pc.removeEventListener('icegatheringstatechange', chk); res(); }
+    function done() { clearTimeout(t); clearTimeout(grace); pc.removeEventListener('icegatheringstatechange', chk); pc.removeEventListener('icecandidate', cand); res(); }
     function chk() { if (pc.iceGatheringState === 'complete') done(); }
+    function cand(e) { if (e.candidate && /typ (srflx|relay)/.test(e.candidate.candidate) && !grace) grace = setTimeout(done, 1000); }
     pc.addEventListener('icegatheringstatechange', chk);
+    pc.addEventListener('icecandidate', cand);
+    if (pc.iceGatheringState === 'complete') done();
   });
+}
+
+// Can this network send UDP to the internet at all? A throwaway connection
+// asks the STUN servers for our public address: no answer within
+// NO_PUBLIC_MS (or gathering ends without one) means UDP is blocked (school,
+// office, some mobile networks), so no direct path can ever form. Separate
+// from the answer's own gathering, which Chrome cuts short the moment the
+// host's offer shows an address it can reach locally (same machine or LAN).
+let udpProbe = null;
+function probeUdp(servers) {
+  if (udpProbe) return udpProbe;
+  const p = udpProbe = new Promise(res => {
+    let pc;
+    const fin = v => { clearTimeout(t); try { pc.close(); } catch { } res(v); };
+    const t = setTimeout(() => fin(false), NO_PUBLIC_MS);
+    try {
+      pc = new RTCPeerConnection({ iceServers: servers });
+      pc.createDataChannel('probe');
+      pc.onicecandidate = e => {
+        if (!e.candidate) fin(false);
+        else if (/typ (srflx|relay)/.test(e.candidate.candidate)) fin(true);
+      };
+      pc.createOffer().then(o => pc.setLocalDescription(o)).catch(() => fin(true));
+    } catch { fin(true); }  // cannot tell: try the direct path as before
+  });
+  p.then(ok => { if (!ok && udpProbe === p) udpProbe = null; });  // networks change: ask again next time
+  return p;
 }
 function deferred() { let r, s = false; const p = new Promise(x => r = x); return { promise: p, resolve: v => { if (!s) { s = true; r(v); } } }; }
 
@@ -470,7 +509,10 @@ async function attempt(id, code, room, gen, onLive) {
   try { sdp = await openBlob(room.offer, code); } catch (e) { return e.message === 'wrong code' ? 'badcode' : 'failed'; }
   if (gen !== generation) return 'aborted';
   status('Connecting…');
-  const pc = new RTCPeerConnection({ iceServers: await iceServers(), bundlePolicy: 'max-bundle' });
+  const servers = await iceServers();
+  const canRelay = (room.caps || []).includes('relay') && relaySupported();
+  const udp = canRelay ? probeUdp(servers) : Promise.resolve(true);
+  const pc = new RTCPeerConnection({ iceServers: servers, bundlePolicy: 'max-bundle' });
   S.pc = pc; S.hello = null; S.hostStat = null; S.last = null; S.jbTarget = 0;
   let done = deferred(), gotAudio = false, byeReason = '';
 
@@ -511,8 +553,13 @@ async function attempt(id, code, room, gen, onLive) {
     if (tr) tr.direction = 'sendrecv';
     S.sender = tr ? tr.sender : null;
     const ans = await pc.createAnswer();
+    const gathering = gatherComplete(pc, GATHER_TIMEOUT);
     await pc.setLocalDescription({ type: 'answer', sdp: mungeAnswer(ans.sdp) });
-    await gatherComplete(pc, GATHER_TIMEOUT);
+    await gathering;
+    if (gen !== generation) { pc.close(); return 'aborted'; }
+    // UDP blocked: go straight to the relay instead of answering with an
+    // offer that can never connect (and waiting to find that out).
+    if (!(await udp)) { pc.close(); return 'noudp'; }
     if (gen !== generation) { pc.close(); return 'aborted'; }
     const answer = await sealBlob(pc.localDescription.sdp, code);
     const post = await fetch(`${BASE}/api/room/${id}/answer`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ answer, session: room.session }) });
@@ -524,9 +571,9 @@ async function attempt(id, code, room, gen, onLive) {
     // "Connected" means audio packets arrived, not merely that ICE said so.
     const watch = setInterval(async () => {
       if (gen !== generation) return done.resolve('aborted');
-      // Seven seconds of connectivity checks without a single reply means the
+      // Five seconds of connectivity checks without a single reply means the
       // two networks cannot reach each other: stop waiting, use the relay.
-      if (Date.now() - posted > 7000 && (room.caps || []).includes('relay')) {
+      if (Date.now() - posted > 5000 && (room.caps || []).includes('relay')) {
         try {
           let sent = 0, answered = 0;
           (await pc.getStats()).forEach(r => { if (r.type === 'candidate-pair') { sent += r.requestsSent || 0; answered += r.responsesReceived || 0; } });
@@ -662,7 +709,13 @@ async function relayAttempt(id, code, room, gen, onLive) {
       }
     } else if (plain[0] === 2) {
       let m; try { m = JSON.parse(new TextDecoder().decode(plain.subarray(1))); } catch { return; }
-      if (m.t === 'hello') { S.hello = m; S.name = m.name || ''; renderHost(); }
+      if (m.t === 'hello') {
+        S.hello = m; S.name = m.name || ''; renderHost();
+        // The host may have joined the relay after our first hello was sent
+        // (the server keeps nothing for an absent peer): answer every hello
+        // until audio flows, or both sides would wait for each other.
+        if (!gotPcm) { send({ t: 'name', name: deviceName() }); sendPrefs(); }
+      }
       else if (m.t === 'stat') { S.hostStat = m; renderHost(); }
       else if (m.t === 'pong') { R.rtt = Date.now() - m.id; }
       else if (m.t === 'bye') { byeReason = m.reason || ''; done.resolve('bye'); }
@@ -672,10 +725,10 @@ async function relayAttempt(id, code, room, gen, onLive) {
   ws.onmessage = ev => { if (typeof ev.data !== 'string') relayChain = relayChain.then(() => handle(ev.data)); };
   ws.onclose = () => done.resolve(S.live ? 'dropped' : 'failed');
   ws.onopen = () => {
-    // Say hello until the host answers: it may join the relay after us.
+    // Say hello until audio arrives: the host may join the relay after us.
     const hi = () => { send({ t: 'name', name: deviceName() }); sendPrefs(); };
     hi();
-    R.ready = setInterval(() => { if (S.hello) clearInterval(R.ready); else hi(); }, 1000);
+    R.ready = setInterval(() => { if (gotPcm) clearInterval(R.ready); else hi(); }, 1000);
   };
 
   const timer = setTimeout(() => done.resolve('timeout'), ATTEMPT_TIMEOUT);
@@ -756,6 +809,7 @@ async function enterListening() {
       navigator.mediaSession.playbackState = 'playing';
     } catch { }
   }
+  if (!S.talkTrack) audioSession('playback');
   setupViz();
   clearInterval(S.statTimer);
   S.statTimer = setInterval(pollStats, 1000);
@@ -893,7 +947,16 @@ function setupViz() {
 // ============================================================================
 // Talk back (asks first before the microphone goes on; off is immediate)
 // ============================================================================
+// Safari (iOS 16.4+): say what the page does with audio. "playback" while
+// only listening (keeps playing with the screen locked); "play-and-record"
+// while the mic is on, which keeps the sound on the loudspeaker or the
+// headphones instead of moving it to the quiet earpiece.
+function audioSession(type) {
+  try { if (navigator.audioSession && navigator.audioSession.type !== type) navigator.audioSession.type = type; } catch { }
+}
+
 async function beginTalk() {
+  audioSession('play-and-record');
   if (S.relay) return beginRelayTalk();
   if (!S.sender || S.talkTrack) return;
   try {
@@ -913,6 +976,7 @@ async function beginTalk() {
     meterTalk(ms);
   } catch (e) {
     $('micLbl').textContent = 'No mic access';
+    if (!S.talkTrack) audioSession('playback');
   }
 }
 // Over the relay the mic is encoded here with the browser's Opus encoder and
@@ -960,11 +1024,13 @@ async function beginRelayTalk() {
     meterTalk(ms);
   } catch (e) {
     $('micLbl').textContent = 'No mic access';
+    if (!S.talkTrack) audioSession('playback');
   }
 }
 
 function endTalk() {
   if (!S.talkTrack) return;
+  audioSession('playback');
   if (S.relayTalk) {
     const T = S.relayTalk; S.relayTalk = null;
     try { T.src.disconnect(); T.cap.disconnect(); T.sink.disconnect(); } catch { }

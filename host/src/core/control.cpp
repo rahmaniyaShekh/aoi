@@ -9,6 +9,16 @@ using json = nlohmann::json;
 
 namespace aoi {
 
+json devices_json(const std::vector<DeviceInfo> &list) {
+  json a = json::array();
+  int n = 0;
+  for (auto &d : list)
+    a.push_back({{"n", ++n}, {"id", d.id}, {"name", d.name}, {"type", device_type(d)}, {"bus", to_string(d.bus)},
+                 {"form", to_string(d.form)}, {"default", d.default_console}, {"comms", d.default_comms},
+                 {"hfp", d.bluetooth_hfp}, {"le", d.bluetooth_le}, {"container", d.container}});
+  return a;
+}
+
 json snapshot_json(const Snapshot &s) {
   json ls = json::array();
   for (const ListenerView &v : s.listeners) {
@@ -24,7 +34,23 @@ json snapshot_json(const Snapshot &s) {
                   {"music_mute", v.prefs.music_mute}, {"voice_mute", v.prefs.voice_mute},
                   {"duck", v.prefs.duck}, {"max_kbps", v.prefs.max_kbps}});
   }
+  auto dev = [](const DeviceView &d) {
+    return json{{"id", d.id}, {"name", d.name}, {"type", d.type}, {"reason", d.reason}, {"error", d.error},
+                {"note", d.note}, {"present", d.present}, {"running", d.running}, {"access_denied", d.access_denied},
+                {"rate", d.rate}, {"channels", d.channels}, {"format", d.format}, {"latency_ms", d.latency_ms}};
+  };
+  const VoiceStats &v = s.voice;
+  auto opt = [](const auto &o) { return o ? json(*o) : json(nullptr); };
+  json voice = {{"apm", v.apm}, {"aec", v.aec}, {"ns", v.ns}, {"agc", v.agc}, {"reference_active", v.reference_active},
+                {"echo", v.echo}, {"erle_db", opt(v.erle_db)}, {"erl_db", opt(v.erl_db)}, {"delay_ms", opt(v.delay_ms)},
+                {"residual_echo", opt(v.residual_echo)}, {"speech_prob", v.speech_prob}, {"voice", v.voice},
+                {"in_speech_dbfs", v.in_speech_dbfs}, {"out_speech_dbfs", v.out_speech_dbfs}, {"gain_db", v.gain_db},
+                {"speech_s", v.speech_seconds}, {"cpu_avg_us", v.cpu_avg_us}, {"cpu_max_us", v.cpu_max_us},
+                {"blocks", v.blocks}, {"reverse_blocks", v.reverse_blocks}, {"measured_erle_db", opt(v.measured_erle_db)},
+                {"echo_in_dbfs", v.echo_in_dbfs}, {"echo_out_dbfs", v.echo_out_dbfs}};
   return {{"code", s.code}, {"pretty", s.pretty}, {"link", s.link}, {"status", s.status}, {"error", s.error},
+          {"mic_dev", dev(s.mic_dev)}, {"speaker_dev", dev(s.speaker_dev)}, {"echo_reference", s.echo_reference},
+          {"mic_volume", opt(s.mic_volume)}, {"mic_switching", s.mic_switching}, {"voice", voice},
           {"published", s.published}, {"socket", s.socket}, {"turn", s.turn}, {"source", s.source},
           {"process_loopback", s.process_loopback}, {"mic", s.mic}, {"mic_name", s.mic_name},
           {"mic_active", s.mic_active}, {"mic_level_db", s.mic_level_db}, {"talkback", s.talkback},
@@ -58,6 +84,14 @@ std::string ControlServer::handle(const std::string &text) {
     engine_.rotate_code();
   } else if (cmd == "kick") {
     engine_.kick(req.value("id", 0));
+  } else if (cmd == "devices") {
+    out["captures"] = devices_json(engine_.devices(DeviceKind::Capture));
+    out["renders"] = devices_json(engine_.devices(DeviceKind::Render));
+    out["status"] = snapshot_json(engine_.snapshot());
+  } else if (cmd == "mic" || cmd == "speaker") {
+    std::string msg;
+    bool ok = engine_.choose_device(cmd == "mic" ? DeviceKind::Capture : DeviceKind::Render, req.value("arg", ""), &msg);
+    out = {{"ok", ok}, {"message", msg}};
   } else {
     out = {{"ok", false}, {"error", "unknown command"}};
   }

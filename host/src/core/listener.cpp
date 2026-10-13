@@ -85,7 +85,13 @@ void Listener::shutdown() {
   qcv_.notify_all();
   if (thread_.joinable() && thread_.get_id() != std::this_thread::get_id()) thread_.join();
   sim_.reset();
+  {
+    std::lock_guard lk(rq_mu_);
+    rq_stop_ = true;
+  }
+  rq_cv_.notify_all();
   if (rws_) rws_->close();
+  if (relay_tx_thread_.joinable() && relay_tx_thread_.get_id() != std::this_thread::get_id()) relay_tx_thread_.join();
   if (relay_thread_.joinable() && relay_thread_.get_id() != std::this_thread::get_id()) relay_thread_.join();
   if (pc_ && !relay_) {
     if (dc_) dc_->resetCallbacks();
@@ -235,6 +241,7 @@ bool Listener::start_relay(const std::string &url, const std::vector<uint8_t> &k
   relay_ = true;
   state_ = State::Connecting;
   relay_thread_ = std::thread([this] { relay_loop(); });
+  relay_tx_thread_ = std::thread([this] { relay_tx_loop(); });
   notify_settings();  // repeated by the sender loop until the page answers
   LOGI("listener %d: relaying through the server (their network cannot reach this one directly)", id_);
   return true;
@@ -245,14 +252,51 @@ void Listener::relay_send(uint8_t type, const uint8_t *p, size_t n) {
   std::vector<uint8_t> plain(n + 1);
   plain[0] = type;
   if (n) memcpy(plain.data() + 1, p, n);
-  auto sealed = aead_seal(relay_key_, plain.data(), plain.size());
-  int64_t t0 = now_us();
-  if (!rws_->send_binary(sealed.data(), sealed.size())) {
-    if (state_ != State::Closed) LOGI("listener %d: relay closed", id_);
-    state_ = State::Closed;
-    return;
+  RelayMsg m{type == 1, type == 1 ? relay_batch_ms_ : 0, aead_seal(relay_key_, plain.data(), plain.size())};
+  std::lock_guard lk(rq_mu_);
+  if (rq_stop_) return;
+  if (m.audio) {
+    // More than ~0.4 s waiting means the path is slower than the stream:
+    // late audio is worth nothing, so make room by dropping the oldest. The
+    // page's buffer rides over the gap and the bitrate drops right away.
+    while (rq_audio_ms_ + m.ms > 400) {
+      auto it = std::find_if(rq_.begin(), rq_.end(), [](const RelayMsg &x) { return x.audio; });
+      if (it == rq_.end()) break;
+      rq_audio_ms_ -= it->ms;
+      relay_dropped_ms_ += uint64_t(it->ms);
+      rq_.erase(it);
+    }
+    rq_audio_ms_ += m.ms;
   }
-  relay_send_ms_.add(double(now_us() - t0) / 1000.0, 0.2);
+  rq_.push_back(std::move(m));
+  relay_backlog_ms_ = rq_audio_ms_;
+  rq_cv_.notify_one();
+}
+
+void Listener::relay_tx_loop() {
+  raise_thread_priority();
+  for (;;) {
+    RelayMsg m;
+    {
+      std::unique_lock lk(rq_mu_);
+      rq_cv_.wait(lk, [&] { return rq_stop_ || !rq_.empty(); });
+      if (rq_stop_) return;
+      // Control first: a stats reply or a "bye" must not wait behind audio.
+      auto it = std::find_if(rq_.begin(), rq_.end(), [](const RelayMsg &x) { return !x.audio; });
+      if (it == rq_.end()) it = rq_.begin();
+      m = std::move(*it);
+      if (m.audio) rq_audio_ms_ -= m.ms;
+      rq_.erase(it);
+      relay_backlog_ms_ = rq_audio_ms_;
+    }
+    int64_t t0 = now_us();
+    if (!rws_->send_binary(m.data.data(), m.data.size())) {
+      if (state_ != State::Closed) LOGI("listener %d: relay closed", id_);
+      state_ = State::Closed;
+      return;
+    }
+    if (m.audio) relay_send_ms_.add(double(now_us() - t0) / 1000.0, 0.2);
+  }
 }
 
 // ~80 ms of audio per message: few enough messages to sit comfortably inside
@@ -354,7 +398,12 @@ bool Listener::dead() const {
 }
 
 void Listener::push(std::shared_ptr<const SourceBlock> b) {
-  if (state_ != State::Live) return;
+  // A relayed listener gets audio as soon as the socket is up, before the
+  // page has spoken: it is sealed with the key only that page holds, and a
+  // page that greeted before we joined the relay would otherwise wait for us
+  // while we wait for it.
+  State s = state_;
+  if (s != State::Live && !(relay_ && s == State::Connecting)) return;
   std::lock_guard lk(qmu_);
   queue_.push_back(std::move(b));
   // A listener whose encoder cannot keep up must never back up the capture
@@ -381,18 +430,26 @@ void Listener::sender_loop() {
         last_stat_us_ = now;
         if (state_ != State::Live) { notify_settings(); continue; }  // until the page answers
         send_stats();
-        // Relay rate control: back off when the page runs dry or sends start
-        // to block (the TCP path is full); creep up after 10 clean seconds.
-        if (now - relay_adapt_us_ > 2000000) {
+        // Relay rate control. Back off at once when the path shows stress: the
+        // page ran dry, audio is queueing here (TCP is full), or sends block.
+        // Climb by a quarter after 5 clean seconds, so a fast path reaches
+        // full quality in about 20 s and a slow one is never pushed past it.
+        if (now - relay_adapt_us_ > 1000000) {
           relay_adapt_us_ = now;
           double conceal;
           { std::lock_guard lk(mu_); conceal = rx_conceal_; }
           int k = relay_kbps_;
-          if (conceal > 0.005 || (relay_send_ms_.init && relay_send_ms_.v > 40)) {
-            relay_kbps_ = std::max(16, k * 3 / 4);
+          bool stress = conceal > 0.005 || relay_backlog_ms_ > 160 || (relay_send_ms_.init && relay_send_ms_.v > 40);
+          if (stress) {
+            // At most one cut per 2 s (the page's report lags), unless audio
+            // is already piling up here.
+            if (now - relay_cut_us_ > 2000000 || relay_backlog_ms_ > 300) {
+              relay_kbps_ = std::max(16, k * 7 / 10);
+              relay_cut_us_ = now;
+            }
             relay_clean_since_ = now;
-          } else if (now - relay_clean_since_ > 10000000) {
-            relay_kbps_ = std::min(192, k + 16);
+          } else if (now - relay_clean_since_ > 5000000) {
+            relay_kbps_ = std::min(192, std::max(k + 8, k * 5 / 4));
             relay_clean_since_ = now;
           }
         }
@@ -695,7 +752,7 @@ ListenerView Listener::view() const {
     v.cc_state = relay_ ? "relay" : cc_.state();
     v.rtt_ms = cc_.rtt_ms() > 0 ? cc_.rtt_ms() : rx_rtt_ms_;
     v.loss = cc_.loss();
-    v.queue_ms = cc_.queue_ms();
+    v.queue_ms = relay_ ? double(relay_backlog_ms_) : cc_.queue_ms();
     v.target_kbps = relay_ ? double(relay_kbps_) : cc_.target_bps() / 1000.0;
     v.opus_kbps = applied_.opus_bps / 1000.0;
     v.frame_ms = applied_.frame_ms;

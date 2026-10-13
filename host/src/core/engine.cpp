@@ -3,6 +3,8 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
+#include <cstdlib>
 #include <cstring>
 
 #include "crypto.h"
@@ -12,13 +14,57 @@ using json = nlohmann::json;
 
 namespace aoi {
 
+// One open microphone with its own voice processor. The stream's thread
+// re-blocks to 10 ms, processes, and writes into `reader`, which the
+// system-capture thread reads on its own clock.
+struct Engine::MicChannel {
+  DeviceInfo dev;
+  std::string reason;
+  std::shared_ptr<VoiceProcessor> vp;
+  DriftReader reader{kRate * 2};
+  std::unique_ptr<AudioStream> stream;
+  std::vector<float> acc;
+  int64_t opened_us = 0;
+  float saved_gain = -100.f;
+  int xfade = -1;  // capture thread only: crossfade position while this channel takes over
+  const std::function<void(const float *, const float *, int)> *tap = nullptr;
+
+  void on_audio(const float *x, int n) {
+    acc.insert(acc.end(), x, x + n);
+    size_t at = 0;
+    std::array<float, kBlock> raw;
+    while (acc.size() - at >= size_t(kBlock)) {
+      if (tap) std::copy(acc.begin() + long(at), acc.begin() + long(at) + kBlock, raw.begin());
+      vp->process(acc.data() + at);
+      if (tap) (*tap)(raw.data(), acc.data() + at, kBlock);
+      reader.write(acc.data() + at, kBlock);
+      at += kBlock;
+    }
+    acc.erase(acc.begin(), acc.begin() + long(at));
+  }
+};
+
+namespace {
+constexpr int kXfade = kRate / 50;  // 20 ms crossfade between two microphones
+
+// Where AGC2 starts for a microphone it has not met before: mouth-near
+// headset mics are hot, laptop arrays and desk mics quiet.
+float default_initial_gain(const DeviceInfo &d) {
+  return (d.form == FormFactor::Headset || d.form == FormFactor::Handset) ? 12.f : 22.f;
+}
+
+// A render device the mic can hear acoustically.
+bool audible_in_room(const DeviceInfo &d) {
+  return d.form != FormFactor::Headphones && d.form != FormFactor::Headset && d.form != FormFactor::Handset;
+}
+}  // namespace
+
 // ---- engine ----------------------------------------------------------------------------
 Engine::Engine(Settings s) : settings_(std::move(s)) {
   talk_allowed_ = settings_.talkback;
-  mic_on_ = settings_.mic;
   max_kbps_ = settings_.max_kbps;
   level_.set_enabled(settings_.auto_level);
-  mic_reader_.set_target(kRate * 30 / 1000);  // 30 ms head start absorbs the mic's delivery jitter
+  ref2_reader_.set_target(kRate * 30 / 1000);
   talk_mix_.resize(8192);
 }
 
@@ -46,10 +92,23 @@ bool Engine::load_identity(bool fresh) {
 void Engine::start() {
   if (running_.exchange(true)) return;
   load_identity(settings_.new_code);
+  {
+    std::lock_guard lk(dev_mu_);
+    prefs_ = DevicePrefs::load();
+    mic_on_ = settings_.mic && prefs_.mic_on;
+  }
   audio_ = create_audio_system();
+  LOGI("audio: %s; voice processing: %s", audio_->backend().c_str(),
+       VoiceProcessor::apm_available() ? "WebRTC APM (AEC3, NS, AGC2)" : "basic chain (APM not built in)");
   capture_ = audio_->open_system_capture([this](const float *x, int n) { on_system(x, n); });
-  if (settings_.mic) set_mic(true);
-  if (settings_.talkback) render_ = audio_->open_render("", [this](float *x, int n) { render_pull(x, n); });
+  event_token_ = audio_->subscribe([this](DeviceEvent, const std::string &) {
+    // OS notification thread: just flag it; the device thread does the work.
+    std::lock_guard lk(dev_mu_);
+    if (!dev_dirty_) dev_dirty_at_ = now_us();
+    dev_dirty_ = true;
+    dev_cv_.notify_all();
+  });
+  device_thread_ = std::thread([this] { device_loop(); });
   host_thread_ = std::thread([this] { host_loop(); });
   house_thread_ = std::thread([this] { housekeeping(); });
 }
@@ -58,9 +117,12 @@ void Engine::stop() {
   if (!running_.exchange(false)) return;
   stopping_ = true;
   cancel_wait_ = true;
+  dev_cv_.notify_all();
   if (host_thread_.joinable()) host_thread_.join();
   LOGD("stop: host loop done");
   if (house_thread_.joinable()) house_thread_.join();
+  if (device_thread_.joinable()) device_thread_.join();
+  if (audio_ && event_token_) audio_->unsubscribe(event_token_);
   for (auto &l : listeners_copy()) { l->close("host stopped"); }
   std::this_thread::sleep_for(std::chrono::milliseconds(150));  // let the byes out
   {
@@ -73,8 +135,8 @@ void Engine::stop() {
   LOGD("stop: listeners closed");
   if (rdv_) { rdv_->withdraw(); LOGD("stop: withdrawn"); rdv_->stop(); LOGD("stop: rendezvous closed"); }
   capture_.reset();
-  mic_.reset();
-  render_.reset();
+  close_mic();
+  open_output(std::nullopt, std::nullopt);
 }
 
 std::vector<std::shared_ptr<Listener>> Engine::listeners_copy() {
@@ -95,11 +157,10 @@ void Engine::on_system(const float *x, int frames) {
   level_.process(b->system.data(), frames);
   b->mic_on = mic_on_;
   if (b->mic_on) {
-    mic_reader_.read(b->voice.data(), frames);
-    voice_.process(b->voice.data(), frames);
-    b->voice_active = voice_.active();
-    mic_level_db_ = voice_.level_db();
-    mic_active_ = b->voice_active;
+    bool voice = false;
+    read_mic(b->voice.data(), &voice);
+    b->voice_active = voice;
+    mic_active_ = voice;
   }
   meter_.process(b->system.data(), frames, 2);
   std::shared_ptr<const SourceBlock> cb = b;
@@ -111,39 +172,118 @@ void Engine::on_system(const float *x, int frames) {
   for (auto &l : ls) l->push(cb);
 }
 
+// The processed microphone on the system-capture clock, crossfading to a
+// newly chosen device once it has primed, and fading over any gap.
+void Engine::read_mic(float *out, bool *voice) {
+  std::shared_ptr<MicChannel> cur, nxt;
+  {
+    std::lock_guard lk(mic_mu_);
+    cur = cur_;
+    nxt = next_;
+  }
+  bool ok = cur && cur->reader.read(out, kBlock);
+  if (!cur) std::fill(out, out + kBlock, 0.f);
+  bool v = cur && cur->vp->voice_active();
+  if (nxt) {
+    if (nxt->xfade < 0 && nxt->reader.fill() >= nxt->reader.target() + kBlock) nxt->xfade = 0;
+    if (nxt->xfade >= 0) {
+      std::array<float, kBlock> b;
+      bool ok2 = nxt->reader.read(b.data(), kBlock);
+      // If the old device is already gone, take the new one at full level.
+      for (int i = 0; i < kBlock; ++i) {
+        float w = ok ? std::min(1.f, float(nxt->xfade + i) / kXfade) : 1.f;
+        out[i] = out[i] * (1.f - w) + b[i] * w;
+      }
+      ok = ok || ok2;
+      nxt->xfade += kBlock;
+      v = nxt->vp->voice_active();
+      if (nxt->xfade >= kXfade) {
+        std::lock_guard lk(mic_mu_);
+        if (cur_) retired_.push_back(cur_);
+        cur_ = next_;
+        next_.reset();
+        nxt->xfade = -1;
+        dev_cv_.notify_all();  // the device thread closes the old stream
+      }
+    }
+  }
+  // Fade in when audio (re)starts, out over an underrun: no clicks.
+  float target = ok ? 1.f : 0.f;
+  float g0 = mic_gain_;
+  mic_gain_ = target > g0 ? std::min(1.f, g0 + 0.5f) : std::max(0.f, g0 - 0.5f);
+  if (g0 != 1.f || mic_gain_ != 1.f)
+    for (int i = 0; i < kBlock; ++i) out[i] *= g0 + (mic_gain_ - g0) * float(i) / kBlock;
+  double ss = 0;
+  for (int i = 0; i < kBlock; ++i) ss += double(out[i]) * out[i];
+  mic_level_db_ = gain_to_db(float(std::sqrt(ss / kBlock)));
+  *voice = v;
+}
+
 // Render thread: every listener's voice, mixed, with a soft ceiling.
 void Engine::render_pull(float *out, int n) {
   std::fill(out, out + n, 0.f);
   if (!talk_allowed_) return;
   float g = db_to_gain(settings_.talk_gain_db);
   for (auto &l : listeners_copy()) l->mix_talk(out, n, g);
+  if (settings_.test_talk) settings_.test_talk(out, n);
   for (int i = 0; i < n; ++i) {
     float a = std::fabs(out[i]);
     if (a > 0.7f) out[i] = std::copysign(0.7f + 0.3f * std::tanh((a - 0.7f) / 0.3f), out[i]);
   }
 }
 
+void Engine::feed_reference(const float *blk) {
+  if (settings_.ref_tap) settings_.ref_tap(blk, kBlock);
+  std::shared_ptr<MicChannel> a, b;
+  {
+    std::lock_guard lk(mic_mu_);
+    a = cur_;
+    b = next_;
+  }
+  if (a) a->vp->reverse(blk);
+  if (b) b->vp->reverse(blk);
+}
+
+// Echo reference thread (loopback of the talkback output): 10 ms blocks to
+// every open voice processor, with the default speakers' loopback added
+// when the music plays somewhere else.
+void Engine::on_reference(const float *x, int n) {
+  ref_acc_.insert(ref_acc_.end(), x, x + n);
+  size_t at = 0;
+  std::array<float, kBlock> blk, sec;
+  while (ref_acc_.size() - at >= size_t(kBlock)) {
+    std::copy(ref_acc_.begin() + long(at), ref_acc_.begin() + long(at) + kBlock, blk.begin());
+    if (ref2_on_ && ref2_reader_.read(sec.data(), kBlock))
+      for (int i = 0; i < kBlock; ++i) blk[i] += sec[i];
+    feed_reference(blk.data());
+    at += kBlock;
+  }
+  ref_acc_.erase(ref_acc_.begin(), ref_acc_.begin() + long(at));
+}
+
+void Engine::on_secondary_reference(const float *x, int n) { ref2_reader_.write(x, n); }
+
 void Engine::set_mic(bool on) {
-  settings_.mic = on;
+  {
+    std::lock_guard lk(dev_mu_);
+    settings_.mic = true;
+    prefs_.mic_on = on;
+    prefs_.save();
+  }
   mic_on_ = on;
-  if (on) {
-    if (!mic_) {
-      mic_reader_.reset();
-      mic_ = audio_->open_mic("", [this](const float *x, int n) { mic_reader_.write(x, n); });
-    }
-  } else if (mic_) {
-    mic_.reset();
+  if (!on) {
+    close_mic();
     mic_active_ = false;
     mic_level_db_ = -90.f;
   }
+  wake_devices();
   for (auto &l : listeners_copy()) l->notify_settings();
 }
 
 void Engine::set_talkback(bool on) {
   settings_.talkback = on;
   talk_allowed_ = on;
-  if (on && !render_) render_ = audio_->open_render("", [this](float *x, int n) { render_pull(x, n); });
-  if (!on) render_.reset();
+  wake_devices();
   for (auto &l : listeners_copy()) l->notify_settings();
 }
 
@@ -216,6 +356,11 @@ void Engine::host_loop() {
   int backoff = 2000;
   int64_t ice_at = 0;
   std::vector<IceServerCfg> ice;
+  if (settings_.offline) {
+    set_status("Offline (test)");
+    while (running_) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    return;
+  }
   while (running_) {
     if (rotate_ || !rdv_) {
       if (rotate_) {
@@ -333,6 +478,234 @@ void Engine::host_loop() {
   }
 }
 
+
+// ---- devices ----------------------------------------------------------------------------
+void Engine::wake_devices() {
+  {
+    std::lock_guard lk(dev_mu_);
+    dev_dirty_ = true;
+    dev_dirty_at_ = 0;  // no debounce: the owner asked
+  }
+  dev_cv_.notify_all();
+}
+
+std::vector<DeviceInfo> Engine::devices(DeviceKind kind) {
+  return audio_ ? audio_->list_devices(kind) : std::vector<DeviceInfo>{};
+}
+
+bool Engine::choose_device(DeviceKind kind, const std::string &arg, std::string *message) {
+  auto list = devices(kind);
+  bool ok;
+  {
+    std::lock_guard lk(dev_mu_);
+    ok = apply_device_choice(prefs_, kind, list, arg, message);
+    if (ok) prefs_.save();
+    if (ok && kind == DeviceKind::Capture) mic_on_ = settings_.mic && prefs_.mic_on;
+  }
+  if (!ok) return false;
+  LOGI("%s", message ? message->c_str() : "device choice changed");
+  if (!mic_on_) close_mic();
+  wake_devices();
+  for (auto &l : listeners_copy()) l->notify_settings();
+  return true;
+}
+
+void Engine::device_loop() {
+  int64_t last_eval = 0, last_vol = 0, last_save = now_us();
+  while (running_) {
+    bool eval = false;
+    {
+      std::unique_lock lk(dev_mu_);
+      dev_cv_.wait_for(lk, std::chrono::milliseconds(200));
+      if (!running_) break;
+      int64_t now = now_us();
+      // Debounce bursts of OS notifications (a headset connecting fires a
+      // dozen); re-check every 5 s regardless.
+      if (dev_dirty_ && now - dev_dirty_at_ > 300000) eval = true;
+      if (now - last_eval > 5000000) eval = true;
+    }
+    std::vector<std::shared_ptr<MicChannel>> old;
+    {
+      std::lock_guard lk(mic_mu_);
+      old.swap(retired_);
+    }
+    for (auto &ch : old) {
+      save_agc(*ch);
+      ch->stream.reset();
+      LOGD("closed microphone %s", ch->dev.name.c_str());
+    }
+    if (eval) {
+      reevaluate();
+      last_eval = now_us();
+    }
+    int64_t now = now_us();
+    std::shared_ptr<MicChannel> cur;
+    {
+      std::lock_guard lk(mic_mu_);
+      cur = cur_;
+    }
+    if (cur) {
+      // The echo canceller's starting delay: our talkback device's buffering
+      // plus the microphone's. AEC3 refines it itself.
+      double out_ms = 0;
+      {
+        std::lock_guard lk(out_mu_);
+        if (render_) out_ms = render_->status().latency_ms;
+      }
+      StreamStatus ms = cur->stream->status();
+      cur->vp->set_delay_ms(int(std::clamp(out_ms + ms.latency_ms + 10.0, 20.0, 400.0)));
+      if (now - last_vol > 5000000) {
+        last_vol = now;
+        auto v = audio_->input_volume(cur->dev.id);
+        std::lock_guard lk(dev_mu_);
+        mic_volume_ = v;
+      }
+      if (now - last_save > 30000000) {
+        last_save = now;
+        save_agc(*cur);
+      }
+    }
+  }
+}
+
+void Engine::reevaluate() {
+  auto caps = audio_->list_devices(DeviceKind::Capture);
+  auto rens = audio_->list_devices(DeviceKind::Render);
+  DevicePrefs p;
+  {
+    std::lock_guard lk(dev_mu_);
+    p = prefs_;
+    dev_dirty_ = false;
+  }
+  DeviceChoice mc = choose_mic(caps, p);
+  DeviceChoice sc = choose_speaker(rens, mc.device, p);
+  // Music playing on other speakers in the room reaches the mic too: add
+  // that device's output to the echo reference.
+  std::optional<DeviceInfo> sec;
+  for (auto &r : rens)
+    if (r.default_console && (!sc.device || r.id != sc.device->id) && audible_in_room(r)) sec = r;
+  bool mic_changed, spk_changed;
+  {
+    std::lock_guard lk(dev_mu_);
+    mic_changed = (mic_choice_.device ? mic_choice_.device->id : "") != (mc.device ? mc.device->id : "") ||
+                  mic_choice_.reason != mc.reason;
+    spk_changed = (spk_choice_.device ? spk_choice_.device->id : "") != (sc.device ? sc.device->id : "") ||
+                  spk_choice_.reason != sc.reason;
+    mic_choice_ = mc;
+    spk_choice_ = sc;
+  }
+  if (mic_changed) {
+    if (mc.device) {
+      LOGI("microphone: %s (%s; %s)", mc.device->name.c_str(), device_type(*mc.device).c_str(), mc.reason.c_str());
+      std::string note = bluetooth_note(*mc.device);
+      if (!note.empty() && mic_on_) LOGI("%s", note.c_str());
+    } else {
+      LOGI("microphone: none (%s)", mc.reason.c_str());
+    }
+  }
+  if (spk_changed && sc.device)
+    LOGI("talkback output: %s (%s; %s)", sc.device->name.c_str(), device_type(*sc.device).c_str(), sc.reason.c_str());
+
+  if (mic_on_ && mc.device) {
+    std::string have;
+    {
+      std::lock_guard lk(mic_mu_);
+      have = next_ ? next_->dev.id : cur_ ? cur_->dev.id : "";
+    }
+    if (have != mc.device->id) open_mic(*mc.device);
+  } else {
+    close_mic();
+  }
+  open_output(sc.device, sec);
+}
+
+void Engine::open_mic(const DeviceInfo &d) {
+  auto ch = std::make_shared<MicChannel>();
+  ch->dev = d;
+  VoiceOptions o;
+  {
+    std::lock_guard lk(dev_mu_);
+    auto it = prefs_.agc_gain_db.find(d.id);
+    o.initial_gain_db = it != prefs_.agc_gain_db.end() ? it->second : default_initial_gain(d);
+    ch->saved_gain = it != prefs_.agc_gain_db.end() ? it->second : -100.f;
+  }
+  ch->vp = std::make_shared<VoiceProcessor>(o);
+  ch->reader.set_target(kRate * 20 / 1000);  // 20 ms absorbs the mic's 10 ms event-driven delivery
+  ch->opened_us = now_us();
+  if (settings_.mic_tap) ch->tap = &settings_.mic_tap;
+  MicChannel *raw = ch.get();
+  ch->stream = audio_->open_mic(d.id, [raw](const float *x, int n) { raw->on_audio(x, n); });
+  std::lock_guard lk(mic_mu_);
+  if (!cur_) {
+    cur_ = ch;
+  } else {
+    if (next_) retired_.push_back(next_);
+    next_ = ch;
+  }
+}
+
+void Engine::close_mic() {
+  std::shared_ptr<MicChannel> a, b;
+  std::vector<std::shared_ptr<MicChannel>> old;
+  {
+    std::lock_guard lk(mic_mu_);
+    a.swap(cur_);
+    b.swap(next_);
+    old.swap(retired_);
+  }
+  for (auto *ch : {&a, &b}) if (*ch) old.push_back(*ch);
+  for (auto &ch : old) {
+    save_agc(*ch);
+    ch->stream.reset();
+  }
+}
+
+void Engine::save_agc(const MicChannel &ch) {
+  VoiceStats st = ch.vp->stats();
+  if (!st.agc || st.speech_seconds < 5) return;  // not enough speech to have learned anything
+  float g = std::clamp(st.gain_db, 0.f, 30.f);
+  std::lock_guard lk(dev_mu_);
+  float &slot = prefs_.agc_gain_db[ch.dev.id];
+  if (std::fabs(slot - g) < 0.5f) return;
+  slot = g;
+  prefs_.save();
+}
+
+void Engine::open_output(const std::optional<DeviceInfo> &spk, const std::optional<DeviceInfo> &secondary) {
+  std::lock_guard lk(out_mu_);
+  bool run = running_;
+  std::string want = spk ? spk->id : "";
+  bool talk = run && talk_allowed_ && spk;
+  if (!talk || want != render_id_) { render_.reset(); render_id_.clear(); }
+  if (talk && !render_) {
+    render_ = audio_->open_render(want, [this](float *x, int n) { render_pull(x, n); });
+    render_id_ = want;
+  }
+  // The echo reference follows the talkback device whether or not talkback
+  // is on: the music the owner hears comes out of it too.
+  bool need_ref = run && mic_on_ && spk;
+  if (!need_ref || want != ref_id_) { ref_loop_.reset(); ref_id_.clear(); ref_name_.clear(); }
+  if (need_ref && !ref_loop_) {
+    ref_acc_.clear();  // its thread is gone; the next one starts clean
+    ref_loop_ = audio_->open_render_loopback(want, [this](const float *x, int n) { on_reference(x, n); });
+    ref_id_ = want;
+    ref_name_ = spk->name;
+  }
+  std::string want2 = need_ref && secondary ? secondary->id : "";
+  if (want2 != ref2_id_) {
+    ref2_on_ = false;
+    ref_loop2_.reset();
+    ref2_reader_.reset();
+    ref2_id_ = want2;
+    ref2_name_ = want2.empty() ? "" : secondary->name;
+    if (!want2.empty()) {
+      ref_loop2_ = audio_->open_render_loopback(want2, [this](const float *x, int n) { on_secondary_reference(x, n); });
+      ref2_on_ = true;
+      LOGI("echo reference also includes %s (the default output)", ref2_name_.c_str());
+    }
+  }
+}
+
 Snapshot Engine::snapshot() {
   Snapshot s;
   s.code = code_;
@@ -347,15 +720,67 @@ Snapshot Engine::snapshot() {
   s.socket = rdv_ && rdv_->socket_up();
   s.turn = turn_;
   if (capture_) { s.source = capture_->source(); s.process_loopback = capture_->process_loopback(); }
-  s.mic = settings_.mic;
-  if (mic_) {
-    StreamStatus ms = mic_->status();
-    s.mic_name = ms.running ? ms.device_name : "no microphone";
+  s.mic = mic_on_;
+  DeviceChoice mc, sc;
+  {
+    std::lock_guard lk(dev_mu_);
+    mc = mic_choice_;
+    sc = spk_choice_;
+    s.mic_volume = mic_volume_;
   }
+  std::shared_ptr<MicChannel> cur, nxt;
+  {
+    std::lock_guard lk(mic_mu_);
+    cur = cur_;
+    nxt = next_;
+  }
+  s.mic_switching = nxt != nullptr;
+  DeviceView &m = s.mic_dev;
+  m.reason = mc.reason;
+  if (mc.device) {
+    m.id = mc.device->id;
+    m.name = mc.device->name;
+    m.type = device_type(*mc.device);
+    m.present = true;
+    if (mic_on_) m.note = bluetooth_note(*mc.device);
+  }
+  if (auto ch = nxt ? nxt : cur) {
+    StreamStatus st = ch->stream->status();
+    m.running = st.running;
+    m.error = st.error;
+    m.access_denied = st.access_denied;
+    m.rate = st.rate;
+    m.channels = st.channels;
+    m.format = st.format;
+    m.latency_ms = st.latency_ms;
+  }
+  if (cur) s.voice = cur->vp->stats();
+  s.mic_name = m.name.empty() ? "no microphone" : m.name;
   s.mic_active = mic_active_;
   s.mic_level_db = mic_level_db_;
+  DeviceView &o = s.speaker_dev;
+  o.reason = sc.reason;
+  if (sc.device) {
+    o.id = sc.device->id;
+    o.name = sc.device->name;
+    o.type = device_type(*sc.device);
+    o.present = true;
+  }
+  {
+    std::lock_guard lk(out_mu_);
+    if (render_) {
+      StreamStatus st = render_->status();
+      o.running = st.running;
+      o.error = st.error;
+      o.rate = st.rate;
+      o.channels = st.channels;
+      o.latency_ms = st.latency_ms;
+    }
+    if (ref_loop_) s.echo_reference.push_back(ref_name_);
+    if (ref_loop2_) s.echo_reference.push_back(ref2_name_);
+  }
   s.talkback = settings_.talkback;
-  s.talk_device = render_ ? render_->status().device_name : "";
+  s.talk_device = o.name;
   s.auto_level = settings_.auto_level;
   s.max_kbps = settings_.max_kbps;
   s.max_listeners = settings_.max_listeners;
