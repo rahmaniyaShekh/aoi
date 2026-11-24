@@ -1,14 +1,14 @@
 // Rendezvous contract tests: simulates hosts and listeners against a deployed
 // (or `wrangler dev`) Worker.
 //
-//   node test/rendezvous.test.mjs https://share.mdarif.online/aoi
+//   node test/rendezvous.test.mjs https://share.mdarif.in/aoi
 //   node test/rendezvous.test.mjs http://127.0.0.1:8787/aoi
 import { webcrypto as crypto } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-const BASE = (process.argv[2] || 'https://share.mdarif.online/aoi').replace(/\/$/, '');
+const BASE = (process.argv[2] || 'https://share.mdarif.in/aoi').replace(/\/$/, '');
 const EXE = process.argv[3] || fileURLToPath(new URL('../../dist/aoi.exe', import.meta.url));
 let pass = 0, fail = 0;
 const ok = (c, name, detail = '') => { (c ? pass++ : fail++); console.log(`  ${c ? 'PASS' : 'FAIL'}  ${name}${detail ? '  (' + detail + ')' : ''}`); };

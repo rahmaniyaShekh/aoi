@@ -15,8 +15,8 @@ aoi status     # who is listening, bitrate, RTT, loss, buffer, protection
 aoi stop       # stop (or: taskkill /im aoi.exe)
 ```
 
-Listeners go to **https://share.mdarif.online/aoi** and type the code, or open
-`https://share.mdarif.online/aoi/K7Q-4MX` directly.
+Listeners go to **https://share.mdarif.in/aoi** and type the code, or open
+`https://share.mdarif.in/aoi/K7Q-4MX` directly.
 
 ## Commands
 
@@ -194,8 +194,8 @@ browser opened it (echo cancellation, noise suppression, auto gain).
 
 ## Using both apps together
 
-The screen-share app (SOI) keeps `share.mdarif.online` as its Custom Domain; AOI
-is a separate Worker on the route `share.mdarif.online/aoi*`, which runs in front
+The screen-share app (SOI) keeps `share.mdarif.in` as its Custom Domain; AOI
+is a separate Worker on the route `share.mdarif.in/aoi*`, which runs in front
 of it for that path only. Separate Durable Objects, separate codes, separate
 browser storage keys (`aoi.*` vs `soi.*`), separate instance locks. Both hosts
 can run on the same PC at once.
@@ -311,5 +311,5 @@ gh release create v1.0.1 dist\aoi.exe install.ps1 -R rahmaniyaShekh/aoi --title 
 cd rendezvous
 npm install
 npx wrangler deploy
-node test\rendezvous.test.mjs https://share.mdarif.online/aoi
+node test\rendezvous.test.mjs https://share.mdarif.in/aoi
 ```

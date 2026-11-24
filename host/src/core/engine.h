@@ -22,7 +22,7 @@
 namespace aoi {
 
 struct Settings {
-  std::string service = "https://share.mdarif.online/aoi";
+  std::string service = "https://share.mdarif.in/aoi";
   // Everything on by default: no configuration is needed to get music, voice
   // and talkback. A PC with no microphone simply sends music.
   bool mic = true;            // the microphone may be mixed in (the owner turns it off with `aoi mic off`)

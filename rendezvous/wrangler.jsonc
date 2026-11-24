@@ -27,11 +27,11 @@
     { "name": "LOOKUP_LIMIT", "namespace_id": "4201", "simple": { "limit": 90, "period": 60 } }
   ],
 
-  // share.mdarif.online is already a Custom Domain of the screen-share Worker.
+  // share.mdarif.in is already a Custom Domain of the screen-share Worker.
   // A route runs in front of a Custom Domain, so only /aoi* comes here and the
   // rest of the hostname is untouched.
   "routes": [
-    { "pattern": "share.mdarif.online/aoi*", "zone_name": "mdarif.online" }
+    { "pattern": "share.mdarif.in/aoi*", "zone_name": "mdarif.in" }
   ],
 
   "workers_dev": true,

@@ -124,11 +124,11 @@ bool install(std::string *err) {
     std::wstring exe = installed_exe().wstring();
     set_str(k, L"DisplayName", L"AOI - Audio Over Internet");
     set_str(k, L"DisplayVersion", widen(AOI_VERSION));
-    set_str(k, L"Publisher", L"mdarif.online");
+    set_str(k, L"Publisher", L"mdarif.in");
     set_str(k, L"DisplayIcon", exe);
     set_str(k, L"InstallLocation", install_dir().wstring());
     set_str(k, L"UninstallString", L"\"" + exe + L"\" uninstall");
-    set_str(k, L"URLInfoAbout", L"https://share.mdarif.online/aoi");
+    set_str(k, L"URLInfoAbout", L"https://share.mdarif.in/aoi");
     set_dw(k, L"NoModify", 1);
     set_dw(k, L"NoRepair", 1);
     auto sz = std::filesystem::file_size(installed_exe(), ec);
